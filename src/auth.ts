@@ -13,6 +13,7 @@ import { homedir, release } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 import { withFileLock, writeFileAtomic } from '@deepseek-ai/dsh-atomic-write'
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
+import { hardenFilePermissions } from './file-permissions.ts'
 import { regionOf } from './upstream.ts'
 import {
   WorkBuddyAtRestKeyProvider,
@@ -91,6 +92,35 @@ export const WORKBUDDY_AUTH_FILE_ENV = 'WORKBUDDY_AUTH_FILE'
 
 /** Current on-disk format of the plugin-owned copy; readers reject others. */
 const OWN_FORMAT_VERSION = 1
+
+/**
+ * Lifetime assumed for a refresh answer that states no `expiresInSec`.
+ *
+ * The refresh endpoint normally reports one; when it does not, inheriting the
+ * *previous* `expiresAtMs` is actively harmful. `refreshNow` only ever runs
+ * for a credential already inside {@link WorkBuddyCredentialStore}'s refresh
+ * margin (five minutes by default), so a copied expiry is still inside that
+ * margin: `needsRefresh` answers true again on the very next call and every
+ * request pays another refresh round trip — a refresh storm against the
+ * upstream, each round trip spending the single-use refresh token.
+ *
+ * The value is therefore a conservative *default*, not a measurement: it is
+ * half the hour WorkBuddy's own tokens are normally issued for, and six times
+ * the default refresh margin, so an assumed credential always lands well
+ * outside the margin that triggered the refresh. A shorter assumption would
+ * only cost extra refreshes; a longer one risks serving a token the upstream
+ * has already rejected. A lifetime this store has *actually observed* on an
+ * earlier refresh of the same credential always wins over this floor, and the
+ * margin itself is a hard lower bound, so no path through this store can
+ * produce a credential that still needs refreshing.
+ */
+const ASSUMED_REFRESH_LIFETIME_MS = 30 * 60 * 1000
+
+/** First backoff window after a failed refresh; doubles per consecutive failure. */
+const REFRESH_BACKOFF_BASE_MS = 30 * 1000
+
+/** Ceiling for {@link REFRESH_BACKOFF_BASE_MS}; keeps a dead endpoint from being polled hard. */
+const REFRESH_BACKOFF_MAX_MS = 15 * 60 * 1000
 
 interface OwnDocument {
   version: typeof OWN_FORMAT_VERSION
@@ -310,7 +340,10 @@ function isENOENT(error: unknown): boolean {
  * (or already expired), keep the refreshed credential in the plugin-owned
  * copy, and never write the desktop app's file. A failed refresh still
  * returns a not-yet-expired token so an unreachable refresh endpoint does
- * not take down a working session.
+ * not take down a working session — and is then backed off, so "demand-driven"
+ * cannot become "once per request". Concurrent callers share one round trip,
+ * and a refresh answer that states no lifetime still yields a credential
+ * outside the margin, so nothing here can put the store into a refresh loop.
  */
 export class WorkBuddyCredentialStore {
   private readonly variant: WorkBuddyVariant | undefined
@@ -320,6 +353,33 @@ export class WorkBuddyCredentialStore {
   private readonly keyProvider: NonNullable<WorkBuddyStoreOptions['keyProvider']>
   private desktopPathOverride: string | undefined
   private inflight: Promise<WorkBuddyCredential> | undefined
+  /**
+   * Access token of the refresh that is currently in flight, when one is.
+   *
+   * {@link inflight} already coalesces callers that arrive while an attempt is
+   * running. What it cannot cover is a caller that read the credential *before*
+   * the attempt finished: by the time it looks, the attempt is over and the
+   * field is cleared, so the caller still holds the pre-refresh value and
+   * starts an attempt of its own. Naming the credential an attempt is refreshing
+   * lets such a caller be told "that is already being handled", and the re-read
+   * in {@link resolve} is what makes it answer with the refreshed copy.
+   */
+  private inflightFor: string | undefined
+  /**
+   * When the next refresh attempt is allowed and which credential it was for,
+   * with the number of failures in a row that produced that window. See
+   * {@link noteRefreshFailure}.
+   */
+  private refreshNotBeforeMs = 0
+  private backoffCredentialToken: string | undefined
+  private consecutiveRefreshFailures = 0
+  /**
+   * The last lifetime this store observed the upstream *state* for one
+   * credential, keyed by the pair that identifies a refresh chain (uid plus
+   * refresh token, neither of which changes on a refresh that rotates only the
+   * access token). See {@link refreshLifetimeMs}.
+   */
+  private readonly observedLifetimes = new Map<string, number>()
 
   constructor(options: WorkBuddyStoreOptions) {
     this.variant = options.variant
@@ -408,7 +468,11 @@ export class WorkBuddyCredentialStore {
 
   /**
    * The credential to send upstream: {@link current}, refreshed on demand.
-   * Single-flight, so parallel requests share one refresh.
+   *
+   * Concurrent callers coalesce onto one refresh (see {@link inflightFor}),
+   * and a *failing* refresh is backed off rather than retried on every request
+   * (see {@link noteRefreshFailure}), so neither a slow endpoint nor a broken
+   * one can turn demand into a request storm.
    */
   async resolve(): Promise<WorkBuddyCredential> {
     const credential = await this.current()
@@ -422,11 +486,54 @@ export class WorkBuddyCredentialStore {
       )
     }
     if (!this.needsRefresh(credential)) return credential
-    this.inflight ??= this.refreshNow(credential)
-      .finally(() => {
+    const joined = this.joinable(credential)
+    if (joined !== undefined) return joined
+    // Re-read before spending the round trip. This read happened before the
+    // checks above, so a refresh that landed in between — this process's, or
+    // another DSH process sharing the same home directory — leaves the copy
+    // already refreshed while this call still holds the pre-refresh value. The
+    // single-flight field cannot cover that window (the attempt it names has
+    // finished and cleared it), so without this re-read every reader whose file
+    // read overlapped a refresh started one of its own: a refresh storm reached
+    // through nothing worse than concurrency. A refresh token the upstream
+    // rotates is spent by each of those round trips, so the storm can also end
+    // the session outright.
+    const latest = await this.current()
+    let target = credential
+    if (latest !== undefined && latest.accessToken !== credential.accessToken) {
+      // Already refreshed by someone else while this call was reading: that
+      // credential is the answer when it is outside the margin.
+      if (!this.needsRefresh(latest)) return latest
+      // It has a refresh need of its own, so refresh *it* rather than the copy
+      // this call started with. The two can belong to different accounts — the
+      // desktop app can switch sign-in between the two reads — and spending one
+      // account's refresh token for the other's turn is exactly the
+      // cross-account leak `current()` exists to prevent.
+      target = latest
+    }
+    // The same two checks are repeated here because the re-read above awaits
+    // and the state it reads can change while it runs: without this, a caller
+    // that stalled on its file read would start an attempt of its own instead
+    // of joining the one now running. Nothing awaits between this check and the
+    // assignment below, so exactly one caller can win the race.
+    const raced = this.joinable(target)
+    if (raced !== undefined) return raced
+    if (this.backoffCredentialToken === target.accessToken && Date.now() < this.refreshNotBeforeMs) {
+      return target
+    }
+    const attempt = this.refreshNow(target)
+    this.inflight = attempt
+    this.inflightFor = target.accessToken
+    try {
+      return await attempt
+    } finally {
+      // Only the attempt that is still the recorded one clears the state: a
+      // refresh that somehow overlapped a newer one must not erase its record.
+      if (this.inflight === attempt) {
         this.inflight = undefined
-      })
-    return this.inflight
+        this.inflightFor = undefined
+      }
+    }
   }
 
   /** Read-only sign-in summary; never refreshes and never throws. */
@@ -461,10 +568,39 @@ export class WorkBuddyCredentialStore {
     }
   }
 
-  /** Remove the plugin-owned copy; the desktop file is untouched. */
+  /**
+   * Remove the plugin-owned copy; the desktop file is untouched.
+   *
+   * Only the credential file is removed. The `<ownPath>.lock` sibling is
+   * *not*: it is the `wx`-created mutex `withFileLock` uses to serialize
+   * cross-process writers of this file (see
+   * `@deepseek-ai/dsh-atomic-write`), and `withFileLock` releases it by
+   * unlinking its own record. Deleting it here would break that mutual
+   * exclusion rather than speed anything up: another process may be inside the
+   * critical section holding that very inode, and a third writer would then
+   * create a *fresh* lock at the same path and enter concurrently — exactly the
+   * read-modify-write race the lock exists to prevent. A lock left behind by a
+   * crashed holder is already handled by the package: its recorded PID is
+   * probed and the lock is taken over when that process is gone. Removal is
+   * best-effort (`force`), so logging out twice is not an error.
+   */
   async logout(): Promise<void> {
     await rm(this.ownPath, { force: true })
-    await rm(`${this.ownPath}.lock`, { force: true })
+  }
+
+  /**
+   * The in-flight refresh a caller holding `credential` may join, if any.
+   *
+   * A joiner that read the credential *before* the answer landed gets the
+   * refreshed copy from the returned promise, which is the whole point: the
+   * round trip is shared rather than repeated. Only an attempt for the *same*
+   * credential is joinable — a newer one (a re-sign-in, a copy another writer
+   * already replaced) gets its own.
+   */
+  private joinable(credential: WorkBuddyCredential): Promise<WorkBuddyCredential> | undefined {
+    return this.inflight !== undefined && this.inflightFor === credential.accessToken
+      ? this.inflight
+      : undefined
   }
 
   private needsRefresh(credential: WorkBuddyCredential): boolean {
@@ -483,21 +619,89 @@ export class WorkBuddyCredentialStore {
         ...credential,
         accessToken: outcome.accessToken,
         ...outcome.refreshToken === undefined ? {} : { refreshToken: outcome.refreshToken },
-        expiresAtMs: outcome.expiresInSec !== undefined
-          ? Date.now() + outcome.expiresInSec * 1000
-          : credential.expiresAtMs,
+        expiresAtMs: Date.now() + this.refreshLifetimeMs(credential, outcome.expiresInSec),
         ...outcome.domain === undefined || outcome.domain === '' ? {} : { domain: outcome.domain },
         source: 'dsh',
       }
+      this.noteRefreshSuccess(credential, outcome.expiresInSec)
       await this.saveOwn(refreshed)
       return refreshed
     } catch (error: unknown) {
-      if (credential.expiresAtMs > Date.now() + 30_000) return credential
+      if (credential.expiresAtMs > Date.now() + 30_000) {
+        this.noteRefreshFailure(credential)
+        return credential
+      }
       throw new Error(
         `workbuddy: token refresh failed and the access token is expired (${String(error)});`
         + ' open the WorkBuddy desktop app once to sign in again',
       )
     }
+  }
+
+  /**
+   * How long the credential a refresh just returned is good for, in
+   * milliseconds.
+   *
+   * A stated lifetime is believed and recorded as the observed lifetime of this
+   * credential. When the upstream states none the *observed* one is used, so a
+   * chain of refreshes that never states a lifetime still tracks what the
+   * server actually issues. In both cases the result is floored at the refresh
+   * margin plus a minute: the whole point of a refresh is to leave the margin
+   * that triggered it, and a lifetime that does not would make every subsequent
+   * request refresh again (the bug this exists to prevent). The fallback when
+   * nothing has been observed is {@link ASSUMED_REFRESH_LIFETIME_MS}.
+   */
+  private refreshLifetimeMs(credential: WorkBuddyCredential, expiresInSec: number | undefined): number {
+    const observed = expiresInSec !== undefined
+      ? expiresInSec * 1000
+      : this.observedLifetimes.get(this.lifetimeKey(credential)) ?? ASSUMED_REFRESH_LIFETIME_MS
+    return Math.max(observed, this.refreshMarginMs + 60_000)
+  }
+
+  /** The credential pair a refresh chain belongs to; see {@link refreshLifetimeMs}. */
+  private lifetimeKey(credential: WorkBuddyCredential): string {
+    return `${credential.uid}\u0000${credential.refreshToken}`
+  }
+
+  /** Remember the lifetime the upstream just stated, for a silent next refresh. */
+  private noteRefreshSuccess(credential: WorkBuddyCredential, expiresInSec: number | undefined): void {
+    this.consecutiveRefreshFailures = 0
+    this.refreshNotBeforeMs = 0
+    this.backoffCredentialToken = undefined
+    if (expiresInSec === undefined) return
+    const key = this.lifetimeKey(credential)
+    if (expiresInSec * 1000 === this.observedLifetimes.get(key)) return
+    // Bounded: one entry per credential pair seen in this process. A desktop
+    // re-sign-in, or a refresh that rotates the refresh token, makes a new key
+    // and makes the old one unreachable forever.
+    if (this.observedLifetimes.size >= 16) {
+      // Drop the oldest insertion; a re-observation simply re-adds it.
+      const oldest = this.observedLifetimes.keys().next()
+      if (!oldest.done) this.observedLifetimes.delete(oldest.value)
+    }
+    this.observedLifetimes.set(key, expiresInSec * 1000)
+  }
+
+  /**
+   * Record a failed refresh so the next one backs off.
+   *
+   * Without this a *failing* endpoint is hit once per upstream request: the
+   * credential stays inside the margin, so nothing about it ever changes and
+   * every call retries. The window doubles per consecutive failure — one sweep
+   * of the credential poll up to a ceiling — and only ever suppresses a retry
+   * while the stored credential is still worth serving; a caller whose token is
+   * genuinely dead still gets the refresh failure reported (see
+   * {@link refreshNow}), and a *different* credential never waits on this
+   * window at all (see {@link resolve}).
+   */
+  private noteRefreshFailure(credential: WorkBuddyCredential): void {
+    this.consecutiveRefreshFailures = Math.min(this.consecutiveRefreshFailures + 1, 6)
+    const window = Math.min(
+      REFRESH_BACKOFF_BASE_MS * 2 ** (this.consecutiveRefreshFailures - 1),
+      REFRESH_BACKOFF_MAX_MS,
+    )
+    this.refreshNotBeforeMs = Date.now() + window
+    this.backoffCredentialToken = credential.accessToken
   }
 
   private async saveOwn(credential: WorkBuddyCredential): Promise<void> {
@@ -506,6 +710,10 @@ export class WorkBuddyCredentialStore {
         mode: 0o600,
         dirMode: 0o700,
       })
+      // POSIX is already done by `mode`; Windows needs the explicit ACL, or the
+      // token file inherits whatever the parent directory grants. Best-effort:
+      // the credential is saved either way.
+      hardenFilePermissions(this.ownPath)
     })
   }
 
@@ -591,13 +799,29 @@ export class WorkBuddyCredentialStore {
     return 'absent'
   }
 
+  /**
+   * Read the plugin-owned copy.
+   *
+   * Only an absent file means "no plugin-owned copy". Every other failure
+   * propagates, exactly as {@link readDesktop} does for the desktop file: an
+   * EACCES or EISDIR here is a real, fixable problem — a credential file the
+   * user cannot read, or a path that is not a file at all — and reporting it as
+   * "not signed in" would send the user to sign in again while the actual fault
+   * (a bad `DSH_HOME`, a directory in the way, restrictive permissions) stayed
+   * hidden. A document that is present but carries no usable credential
+   * (unparsable, a foreign `version`, no access token) is still *absent* in the
+   * sense that matters: it names no credential, so it falls through to the
+   * desktop file rather than failing the whole read.
+   */
   private async readOwn(): Promise<WorkBuddyCredential | undefined> {
+    let text: string
     try {
-      return parseOwnDocument(await readFile(this.ownPath, 'utf8'))
+      text = await readFile(this.ownPath, 'utf8')
     } catch (error: unknown) {
       if (isENOENT(error)) return undefined
-      return undefined
+      throw error
     }
+    return parseOwnDocument(text)
   }
 
   /**

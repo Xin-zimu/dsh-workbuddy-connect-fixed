@@ -1,8 +1,12 @@
 import { createServer, request, type IncomingMessage, type ServerResponse } from 'node:http'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { Context, Service } from '@deepseek-ai/cordis'
+import LlmRuntime from '@deepseek-ai/dsh-llm'
+import * as WorkBuddy from '../src/index.ts'
+import { LegacySettingsService } from './helpers/legacy-settings.ts'
 import { WorkBuddyCredentialStore } from '../src/auth.ts'
 import { WorkBuddyCatalog, FALLBACK_WORKBUDDY_AI_MODELS, FALLBACK_WORKBUDDY_MODELS } from '../src/catalog.ts'
 import { workBuddyProbeHandler } from '../src/probe-route.ts'
@@ -22,10 +26,15 @@ import type { WorkBuddyUpstreamClient } from '../src/upstream.ts'
  */
 
 const CLEANUP: (() => Promise<void>)[] = []
+/** The plugin context of the one case that boots the real `apply()`. */
+let context: Context | undefined
 
 afterEach(async () => {
+  await context?.fiber.dispose()
+  context = undefined
   await Promise.all(CLEANUP.splice(0).map(clean => clean()))
   vi.unstubAllEnvs()
+  vi.unstubAllGlobals()
 })
 
 function credentialDocument(domain: string): string {
@@ -118,6 +127,125 @@ async function mount(variant: WorkBuddyVariant, options: {
   CLEANUP.push(mounted.close)
   return mounted
 }
+
+/**
+ * Route registration is per-variant, and the host's `webServer.register`
+ * *throws* on a duplicate `(kind, path)`. Registering both variants in one
+ * un-guarded loop therefore let one variant's failed registration abort the
+ * loop, so the *other* variant's card had no routes at all — the opposite of
+ * what the module promises ("Neither variant's startup, catalog fetch, or
+ * credential state can stop the other from registering").
+ *
+ * The fake server below refuses the CN status path only, which is exactly a
+ * composition collision (a stale route, a second copy of the bundle); the
+ * assertion is that the international variant still gets its *pair* of routes.
+ */
+describe('route registration survives a per-variant failure', () => {
+  class MemorySettings extends LegacySettingsService {
+    constructor() {
+      super({ read: () => ({}), persist: () => Promise.resolve() })
+    }
+  }
+
+  /** Collects routes and refuses the CN status path, as a collision would. */
+  class CollidingWebServer extends Service {
+    /** Latest instance, so the case can read what the plugin registered. */
+    static current: CollidingWebServer | undefined
+    readonly registered = new Map<string, unknown>()
+
+    constructor(ctx: Context) {
+      super(ctx, 'webServer')
+      CollidingWebServer.current = this
+    }
+
+    register(route: { path: string }): () => void {
+      if (route.path === CN_VARIANT.statusPath) throw new Error('duplicate route (kind, path)')
+      this.registered.set(route.path, route)
+      return () => { this.registered.delete(route.path) }
+    }
+  }
+
+  it('still registers the other variant when the first variant register throws', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'wb-routes-collide-'))
+    CLEANUP.push(() => rm(root, { recursive: true, force: true }))
+    await writeFile(join(root, 'cn.info'), credentialDocument('copilot.tencent.com'))
+    await writeFile(join(root, 'ai.info'), credentialDocument('www.workbuddy.ai'))
+    vi.stubEnv('DSH_HOME', root)
+    vi.stubEnv('WORKBUDDY_AUTH_FILE', join(root, 'cn.info'))
+    vi.stubEnv('WORKBUDDY_AI_AUTH_FILE', join(root, 'ai.info'))
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('offline in tests') }))
+
+    // A real service registered on the context: the plugin injects
+    // 'webServer' and calls `register` on whatever it finds there. It is
+    // plugged as a *plugin* (a function taking the context and returning the
+    // service), which is how `apply()` sees a host-provided webServer.
+    const ctx = new Context()
+    context = ctx
+    await ctx.plugin(LlmRuntime)
+    ctx.provide('settings', new MemorySettings())
+    await ctx.plugin(CollidingWebServer)
+    await ctx.plugin(WorkBuddy, {})
+
+    const registered = CollidingWebServer.current!.registered
+    await vi.waitFor(() => {
+      expect(registered.has(AI_VARIANT.statusPath)).toBe(true)
+    })
+    // The surviving variant keeps its whole pair, not just whichever route the
+    // failure happened to leave behind.
+    expect(registered.has(AI_VARIANT.probePath)).toBe(true)
+    // And the refused variant registered neither of its own two routes.
+    expect(registered.has(CN_VARIANT.statusPath)).toBe(false)
+    expect(registered.has(CN_VARIANT.probePath)).toBe(false)
+  }, 30_000)
+
+  /**
+   * The same containment for the *credential sweep*, which runs detached from
+   * the plugin's startup chain: a rejection there is an unhandled rejection,
+   * which the host process may treat as fatal.
+   *
+   * The failure is injected where the sweep cannot absorb it. A credential read
+   * that *rejects* is caught by design, so the store is made to throw
+   * synchronously from `current()` — the shape a bug in the sweep itself would
+   * take, and the one no `.catch()` on the call can intercept.
+   */
+  it('keeps serving routes when the credential sweep fails', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'wb-routes-sweep-'))
+    CLEANUP.push(() => rm(root, { recursive: true, force: true }))
+    await writeFile(join(root, 'ai.info'), credentialDocument('www.workbuddy.ai'))
+    vi.stubEnv('DSH_HOME', root)
+    vi.stubEnv('WORKBUDDY_AUTH_FILE', join(root, 'absent-cn.info'))
+    vi.stubEnv('WORKBUDDY_AI_AUTH_FILE', join(root, 'ai.info'))
+    // A short sweep makes the throw repeat several times while this case runs.
+    vi.stubEnv('DSH_WORKBUDDY_POLL_MS', '100')
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('offline in tests') }))
+
+    const ctx = new Context()
+    context = ctx
+    await ctx.plugin(LlmRuntime)
+    ctx.provide('settings', new MemorySettings())
+    await ctx.plugin(CollidingWebServer)
+    // Armed before the plugin boots: the sweep reaches this on every pass,
+    // whether it is the startup one or a timer's.
+    const boom = vi.spyOn(WorkBuddyCredentialStore.prototype, 'current').mockImplementation(() => {
+      throw new Error('credential read exploded')
+    })
+    try {
+      await ctx.plugin(WorkBuddy, {})
+      await vi.waitFor(() => {
+        expect(CollidingWebServer.current!.registered.has(AI_VARIANT.statusPath)).toBe(true)
+      })
+      // Several sweeps' worth of throws, with the routes still registered and
+      // the provider still serving. Without a catch on the detached sweep this
+      // is an unhandled rejection rather than a logged error.
+      await new Promise(resolve => setTimeout(resolve, 500))
+      expect(boom.mock.calls.length).toBeGreaterThan(1)
+      expect(CollidingWebServer.current!.registered.has(AI_VARIANT.probePath)).toBe(true)
+      expect(ctx.llm.listProviders().map(provider => provider.id)).toContain('workbuddy-ai')
+    } finally {
+      boom.mockRestore()
+    }
+  }, 30_000)
+})
 
 describe('per-variant route mount', () => {
   it('serves each variant its own identity, credits, and models', async () => {

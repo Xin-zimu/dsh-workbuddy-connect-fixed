@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -28,6 +28,17 @@ vi.mock('node:os', async (importOriginal) => {
 })
 
 const CLEANUP: (() => Promise<void>)[] = []
+
+/**
+ * Tests below that fake a Linux/WSL platform must also construct POSIX
+ * paths on a real filesystem: XDG overrides only apply to values starting
+ * with `/`, and the WSL translation produces `/mnt/c/...` strings that are
+ * meaningless — and unopenable — on a Windows runner. The platform stub
+ * alone cannot make `join()` or the filesystem POSIX, so these cases run
+ * only where the host path semantics match the platform under test. CI's
+ * Windows leg skips them; its Ubuntu leg covers them.
+ */
+const POSIX_HOST = process.platform !== 'win32'
 
 afterEach(async () => {
   await Promise.all(CLEANUP.splice(0).map(clean => clean()))
@@ -207,6 +218,334 @@ describe('WorkBuddyCredentialStore', () => {
     store.setDesktopPath(second)
     expect(store.desktopAuthPath()).toBe(second)
     await expect(store.resolve()).resolves.toMatchObject({ accessToken: 'at-b', nickname: 'B' })
+  })
+})
+
+/**
+ * Owned-copy behaviour: removal, refresh lifetime, refresh coalescing, and the
+ * failure modes of the copy itself.
+ *
+ * Every case here is about the plugin-owned file only. The desktop file is a
+ * fixture these stores never write — which is the other half of the contract.
+ */
+describe('plugin-owned credential copy', () => {
+  /** A desktop fixture that is always outside the refresh margin. */
+  function freshDesktopDoc(): string {
+    return nestedDoc(Date.now() + 3_600_000)
+  }
+
+  it('removes the credential on logout and leaves the lock file alone', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'wb-logout-'))
+    CLEANUP.push(() => rm(dir, { recursive: true, force: true }))
+    const own = join(dir, 'own.json')
+    const lock = `${own}.lock`
+    // The copy logout must remove...
+    await writeFile(own, JSON.stringify({ version: 1, credential: credentialWith(Date.now() + 3_600_000) }))
+    // ...and the `<ownPath>.lock` sibling `withFileLock` serializes writers
+    // through. It is created here rather than by a concurrent writer because
+    // the invariant under test is about logout's own behaviour: deleting a lock
+    // another process may be holding lets a third writer in, so the file has to
+    // survive untouched.
+    await writeFile(lock, JSON.stringify({ pid: process.pid }))
+    const lockBefore = await stat(lock)
+
+    const store = new WorkBuddyCredentialStore({
+      desktopPath: join(dir, 'absent.info'),
+      ownPath: own,
+      refresh: async credential => ({ accessToken: credential.accessToken }),
+    })
+    await store.logout()
+
+    await expect(readFile(own, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
+    const lockAfter = await stat(lock)
+    // Still a regular file at the same path — not merely recreated. (The mtime
+    // check needs sub-millisecond filesystem timestamps, hence the fallback.)
+    expect(lockAfter.isFile()).toBe(true)
+    expect(lockAfter.size).toBe(lockBefore.size)
+    if (lockBefore.mtimeMs % 1 !== 0) expect(lockAfter.mtimeMs).toBe(lockBefore.mtimeMs)
+    // Logging out twice is not an error: `force` is what makes it idempotent.
+    await expect(store.logout()).resolves.toBeUndefined()
+    // The desktop app's own sign-in was never touched.
+    await expect(store.status()).resolves.toMatchObject({ state: 'signed-out', reasonCode: 'no-credential' })
+  })
+
+  it('does not need another refresh when the refresh answer states no lifetime', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'wb-no-lifetime-'))
+    CLEANUP.push(() => rm(dir, { recursive: true, force: true }))
+    const desktop = join(dir, 'workbuddy-desktop.info')
+    // Already expired: the first resolve must refresh.
+    await writeFile(desktop, nestedDoc(Date.now() - 1000))
+    const requests: string[] = []
+    const store = new WorkBuddyCredentialStore({
+      desktopPath: desktop,
+      ownPath: join(dir, 'own.json'),
+      refresh: async () => {
+        requests.push('refresh')
+        // No `expiresInSec`: the shape that used to inherit the old expiry.
+        return { accessToken: `rotated-${requests.length}` }
+      },
+    })
+
+    const first = await store.resolve()
+    expect(requests).toHaveLength(1)
+    expect(first.accessToken).toBe('rotated-1')
+    // The regression: the old expiry was inherited, so it stayed inside the
+    // margin and every later read refreshed again.
+    expect(first.expiresAtMs).toBeGreaterThan(Date.now() + 5 * 60_000)
+    await expect(store.resolve()).resolves.toMatchObject({ accessToken: 'rotated-1' })
+    await expect(store.resolve()).resolves.toMatchObject({ accessToken: 'rotated-1' })
+    expect(requests).toHaveLength(1)
+    // And it is the copy that carries the derived lifetime, so a restart with
+    // the desktop file gone does not go back to refreshing on every read.
+    const saved = JSON.parse(await readFile(join(dir, 'own.json'), 'utf8')) as { credential: { expiresAtMs: number } }
+    expect(saved.credential.expiresAtMs).toBeGreaterThan(Date.now() + 5 * 60_000)
+  })
+
+  it('follows an observed lifetime for later answers that state none', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'wb-observed-lifetime-'))
+    CLEANUP.push(() => rm(dir, { recursive: true, force: true }))
+    const desktop = join(dir, 'workbuddy-desktop.info')
+    await writeFile(desktop, nestedDoc(Date.now() - 1000))
+    let refreshes = 0
+    const store = new WorkBuddyCredentialStore({
+      desktopPath: desktop,
+      ownPath: join(dir, 'own.json'),
+      refresh: async () => {
+        refreshes += 1
+        // The first answer states a short-but-real lifetime; the second states
+        // none. The second must be derived from what the upstream actually
+        // issues (one hour), not from the compiled-in fallback (half of that).
+        return refreshes === 1
+          ? { accessToken: 'rotated-1', expiresInSec: 3600 }
+          : { accessToken: `rotated-${refreshes}` }
+      },
+    })
+
+    const first = await store.resolve()
+    expect(first.expiresAtMs).toBeGreaterThan(Date.now() + 3500_000)
+    // Force the second refresh through the same credential chain: winding the
+    // stored copy's expiry back is exactly what a long-running process sees
+    // when the hour is nearly up. The refresh token is unchanged, so this is
+    // still the same chain.
+    const own = JSON.parse(await readFile(join(dir, 'own.json'), 'utf8')) as { credential: { expiresAtMs: number } }
+    own.credential.expiresAtMs = Date.now() - 1000
+    await writeFile(join(dir, 'own.json'), JSON.stringify(own))
+    // The desktop file is the identity authority and outranks the copy when its
+    // uid differs; both fixtures carry the same one, so clear it to make the
+    // copy the only credential in play.
+    await rm(desktop)
+
+    const second = await store.resolve()
+    expect(refreshes).toBe(2)
+    expect(second.accessToken).toBe('rotated-2')
+    expect(second.expiresAtMs).toBeGreaterThan(Date.now() + 3500_000)
+  })
+
+  it('does not refresh again for a read that started before the refresh landed', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'wb-single-flight-'))
+    CLEANUP.push(() => rm(dir, { recursive: true, force: true }))
+    const desktop = join(dir, 'workbuddy-desktop.info')
+    await writeFile(desktop, nestedDoc(Date.now() - 1000))
+    const own = join(dir, 'own.json')
+    let refreshes = 0
+    const store = new WorkBuddyCredentialStore({
+      desktopPath: desktop,
+      ownPath: own,
+      refresh: async () => {
+        refreshes += 1
+        return { accessToken: `rotated-${refreshes}`, refreshToken: 'rt', expiresInSec: 3600 }
+      },
+    })
+
+    // This read passes every check — the stored copy is expired — and then
+    // *stalls on its own file read*, which is exactly the interleaving that
+    // used to produce a second refresh: the copy is replaced while this read is
+    // still in flight, so it hands `resolve` a credential that is already
+    // stale. (The pause is injected into the read so the interleaving is
+    // deterministic rather than a race the test would only sometimes hit.)
+    const text = await readFile(desktop, 'utf8')
+    let holdRead = false
+    let releaseStaleRead: (() => void) | undefined
+    const stalledRead = new Promise<void>(resolve => { releaseStaleRead = resolve })
+    // `readDesktop` is private and therefore not on the public surface, and the
+    // real one has to be captured *before* the spy replaces it — calling
+    // `this.readDesktop()` from the mock would re-enter the mock.
+    const proto = WorkBuddyCredentialStore.prototype as unknown as { readDesktop: () => Promise<unknown> }
+    const realReadDesktop = proto.readDesktop
+    const stalling = vi.spyOn(proto, 'readDesktop').mockImplementation(async function (this: unknown) {
+      if (!holdRead) return await realReadDesktop.call(this)
+      holdRead = false
+      await stalledRead
+      return { ...JSON.parse(text), expiresAtMs: Date.now() - 1000, source: 'desktop' }
+    })
+
+    try {
+      holdRead = true
+      const staleReader = store.resolve()
+      // The refresh this read would have duplicated, landing first.
+      const fresh = await store.resolve()
+      expect(refreshes).toBe(1)
+      expect(fresh.accessToken).toBe('rotated-1')
+
+      // Without the re-read this launches a second round trip on a credential
+      // the first one just replaced — and with a rotating refresh token that
+      // second trip is not merely wasteful, it can end the session.
+      releaseStaleRead?.()
+      await expect(staleReader).resolves.toMatchObject({ accessToken: 'rotated-1', source: 'dsh' })
+      expect(refreshes).toBe(1)
+    } finally {
+      stalling.mockRestore()
+    }
+  })
+
+  it('refreshes the credential a concurrent sign-in replaced, not the stale one', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'wb-reread-switch-'))
+    CLEANUP.push(() => rm(dir, { recursive: true, force: true }))
+    const desktop = join(dir, 'workbuddy-desktop.info')
+    // Account A, expired and about to be replaced by a re-sign-in.
+    await writeFile(desktop, nestedDoc(Date.now() - 1000))
+    const own = join(dir, 'own.json')
+    const refreshedFor: string[] = []
+    const store = new WorkBuddyCredentialStore({
+      desktopPath: desktop,
+      ownPath: own,
+      refresh: async credential => {
+        refreshedFor.push(credential.accessToken)
+        return { accessToken: `rotated-${credential.accessToken}`, refreshToken: 'rt', expiresInSec: 3600 }
+      },
+    })
+
+    // The read stalls while the desktop app signs in as B: the copy this call
+    // holds is A's, and B's is on disk by the time it resumes.
+    const aText = await readFile(desktop, 'utf8')
+    const bDocument = JSON.stringify({
+      auth: { accessToken: 'at-b', refreshToken: 'rt-b', expiresAt: Date.now() - 1000, domain: 'www.codebuddy.cn' },
+      account: { uid: 'uid-b', enterpriseId: 'ent-1', nickname: 'B' },
+    })
+    const proto = WorkBuddyCredentialStore.prototype as unknown as { readDesktop: () => Promise<unknown> }
+    const realReadDesktop = proto.readDesktop
+    let holdRead = false
+    let release: (() => void) | undefined
+    const held = new Promise<void>(resolve => { release = resolve })
+    const stalling = vi.spyOn(proto, 'readDesktop').mockImplementation(async function (this: unknown) {
+      if (!holdRead) return await realReadDesktop.call(this)
+      holdRead = false
+      await held
+      // What the *stalled* read returns is A, the account that was signed in
+      // when it started; the sign-in to B lands on disk behind it, so the
+      // re-read inside `resolve` is what sees B.
+      await writeFile(desktop, bDocument)
+      return { ...JSON.parse(aText), expiresAtMs: Date.now() - 1000, source: 'desktop' }
+    })
+
+    try {
+      holdRead = true
+      const staleReader = store.resolve()
+      await new Promise(resolve => setTimeout(resolve, 20))
+      release?.()
+      // B's turn is what the refresh must be spent on: A's token is no longer
+      // signed in, and using it would answer as the wrong account.
+      await expect(staleReader).resolves.toMatchObject({ uid: 'uid-b', source: 'dsh' })
+      expect(refreshedFor).toEqual(['at-b'])
+    } finally {
+      stalling.mockRestore()
+    }
+  })
+
+  it('shares one refresh between reads that overlap the round trip', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'wb-overlap-'))
+    CLEANUP.push(() => rm(dir, { recursive: true, force: true }))
+    const desktop = join(dir, 'workbuddy-desktop.info')
+    await writeFile(desktop, nestedDoc(Date.now() - 1000))
+    let refreshes = 0
+    let releaseRefresh: (() => void) | undefined
+    const gate = new Promise<void>(resolve => { releaseRefresh = resolve })
+    const store = new WorkBuddyCredentialStore({
+      desktopPath: desktop,
+      ownPath: join(dir, 'own.json'),
+      refresh: async () => {
+        refreshes += 1
+        await gate
+        return { accessToken: 'rotated', expiresInSec: 3600 }
+      },
+    })
+
+    const readers = Array.from({ length: 5 }, () => store.resolve())
+    // Let every reader run up to the in-flight refresh before it can answer.
+    await new Promise(resolve => setTimeout(resolve, 50))
+    expect(refreshes).toBe(1)
+    releaseRefresh?.()
+    for (const credential of await Promise.all(readers)) {
+      expect(credential).toMatchObject({ accessToken: 'rotated', source: 'dsh' })
+    }
+    expect(refreshes).toBe(1)
+  })
+
+  it('backs off after a failed refresh instead of retrying on every read', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'wb-backoff-'))
+    CLEANUP.push(() => rm(dir, { recursive: true, force: true }))
+    const desktop = join(dir, 'workbuddy-desktop.info')
+    // Inside the margin but still valid: the credential worth serving while the
+    // endpoint is down.
+    await writeFile(desktop, nestedDoc(Date.now() + 120_000))
+    let refreshes = 0
+    const store = new WorkBuddyCredentialStore({
+      desktopPath: desktop,
+      ownPath: join(dir, 'own.json'),
+      refresh: async () => {
+        refreshes += 1
+        throw new Error('refresh endpoint down')
+      },
+    })
+
+    // The failure is absorbed: the stored token is still worth serving.
+    await expect(store.resolve()).resolves.toMatchObject({ accessToken: 'at' })
+    expect(refreshes).toBe(1)
+    // The backoff window is what stops the storm.
+    await expect(store.resolve()).resolves.toMatchObject({ accessToken: 'at' })
+    await expect(store.resolve()).resolves.toMatchObject({ accessToken: 'at' })
+    expect(refreshes).toBe(1)
+  })
+
+  it('reports an unreadable plugin-owned copy instead of reading it as signed out', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'wb-own-unreadable-'))
+    CLEANUP.push(() => rm(dir, { recursive: true, force: true }))
+    const own = join(dir, 'own.json')
+    // A directory where the copy should be: the `EISDIR`/`EACCES` class of
+    // failure `readDesktop` already refuses to report as "nobody is signed in".
+    await mkdir(own)
+    const store = new WorkBuddyCredentialStore({
+      desktopPath: join(dir, 'absent.info'),
+      ownPath: own,
+      refresh: async credential => ({ accessToken: credential.accessToken }),
+    })
+    await expect(store.current()).rejects.toMatchObject({ code: 'EISDIR' })
+    await expect(store.resolve()).rejects.toMatchObject({ code: 'EISDIR' })
+    // `status()` still never throws: it reports the failure as a diagnosable
+    // signed-out state, naming the real cause rather than "sign in again".
+    const status = await store.status()
+    expect(status.state).toBe('signed-out')
+    expect(status.reason).toMatch(/EISDIR/)
+  })
+
+  it('treats a present-but-unusable plugin-owned copy as absent', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'wb-own-unusable-'))
+    CLEANUP.push(() => rm(dir, { recursive: true, force: true }))
+    const desktop = join(dir, 'workbuddy-desktop.info')
+    await writeFile(desktop, freshDesktopDoc())
+    const own = join(dir, 'own.json')
+    const store = new WorkBuddyCredentialStore({
+      desktopPath: desktop,
+      ownPath: own,
+      refresh: async credential => ({ accessToken: credential.accessToken }),
+    })
+    // Not JSON, a foreign format version, and a document with no access token:
+    // each names no credential, so the desktop file answers. Only a *read*
+    // failure propagates.
+    for (const text of ['{ not json', JSON.stringify({ version: 99, credential: { accessToken: 'at' } }), JSON.stringify({ version: 1, credential: {} })]) {
+      await writeFile(own, text)
+      await expect(store.current()).resolves.toMatchObject({ accessToken: 'at', source: 'desktop' })
+    }
   })
 })
 
@@ -449,7 +788,7 @@ async function asLinux<T>(options: {
     })
   })
 
-  it('skips an empty config-home file and resolves to the data-home credential', async () => {
+  it('skips an empty config-home file and resolves to the data-home credential', { skip: !POSIX_HOST }, async () => {
     // The probe treats an empty file as absent and moves on; the resolved-path
     // diagnostic must agree, or doctor would name the empty config-home file
     // while authentication actually uses the data-home candidate.
@@ -475,7 +814,7 @@ async function asLinux<T>(options: {
     })
   })
 
-  it('resolves the actually-hit path when only the data home carries the file', async () => {
+  it('resolves the actually-hit path when only the data home carries the file', { skip: !POSIX_HOST }, async () => {
     // Issue #43 diagnostics: the first *candidate* is the config home, but
     // when only the data-home copy exists, resolvedDesktopAuthPath() must
     // name it — for both variants.
@@ -501,7 +840,7 @@ async function asLinux<T>(options: {
     })
   })
 
-  it('uses translated WSL environment paths when the Windows user differs', async () => {
+  it('uses translated WSL environment paths when the Windows user differs', { skip: !POSIX_HOST }, async () => {
     const root = await mkdtemp(join(tmpdir(), 'wb-wsl-'))
     CLEANUP.push(() => rm(root, { recursive: true, force: true }))
     const windowsProfile = join(root, 'Users', 'windows-alice')

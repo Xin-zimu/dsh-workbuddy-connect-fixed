@@ -58,6 +58,13 @@ async function captureDoctor(args: string[]): Promise<{ code: number, json: Reco
 describe('doctor desktop auth format', () => {
   let root: string
 
+  // XDG overrides are only honored as absolute POSIX paths (`/...`), and the
+  // fixture below sets XDG_*_HOME to real temp dirs; on a Windows runner those
+  // are `C:\...` values the XDG reader rejects, so the store falls back to the
+  // real `~/.config` and the assertion names the wrong file. POSIX-only, the
+  // same gate `tests/auth.spec.ts` applies to its XDG cases.
+  const POSIX_HOST = process.platform !== 'win32'
+
   afterEach(async () => {
     if (root !== undefined) await rm(root, { recursive: true, force: true })
     root = undefined as unknown as string
@@ -116,7 +123,7 @@ describe('doctor desktop auth format', () => {
     expect((broken.json['desktopAuthFile'] as Record<string, unknown>)['format']).toBe('unrecognized')
   })
 
-  it('reports the XDG data-home file as the desktop auth path when only it exists', async () => {
+  it('reports the XDG data-home file as the desktop auth path when only it exists', { skip: !POSIX_HOST }, async () => {
     // Issue #43: the first *candidate* on Linux is the config home, but the
     // file actually lives under the data home on UOS/deepin. Doctor must name
     // the file that was really hit, for both variants.
