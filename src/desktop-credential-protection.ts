@@ -177,11 +177,22 @@ export function classifyDesktopAuthDocument(text: string): DesktopAuthClassifica
   for (const field of AUTH_FIELDS) {
     const value = auth[field]
     if (typeof value === 'string') continue
+    // `null` and `undefined` both mean "this field holds no value", and they
+    // are read the same way: as a missing token, not as a document this plugin
+    // cannot read. Splitting them was a live defect — the desktop app writes
+    // `null` for a refresh token it has rotated away, so
+    // `{"accessToken":"x","refreshToken":null}` classified as `unrecognized`
+    // and a perfectly valid, signed-in credential was rejected with "cannot
+    // read this file" instead of being used. `parseWorkBuddyAuth` already
+    // treats a non-string token as absent, so this keeps classification and
+    // parsing in agreement rather than inventing a third state.
+    if (value === undefined || value === null) continue
     const wrapped = parseWrappedField(field, value)
-    // A field in *some* object that is not a decodable wrapper: not plaintext,
-    // not usable. Treated as unrecognized below unless another field wrapped.
-    if (wrapped === undefined && value !== undefined) return { format: 'unrecognized' }
-    if (wrapped !== undefined) fields.push(wrapped)
+    // A field that is present, is not a string, and is not a decodable wrapper:
+    // not plaintext, not usable. Treated as unrecognized below unless another
+    // field wrapped.
+    if (wrapped === undefined) return { format: 'unrecognized' }
+    fields.push(wrapped)
   }
   if (fields.length === 0) return { format: 'plaintext' }
   return { format: 'encrypted', wrapped: { document, fields } }
@@ -421,13 +432,30 @@ const WINDOWS_REPLACEMENT_CHARACTER = '\uFFFD'
  *
  * The root is passed as a `-Root` argument, never interpolated into the
  * command text.
+ *
+ * Invocation shape (issue #88 follow-up): the script is wrapped in
+ * `& { … }` and `-Root <value>` follows the wrapper as *separate argv
+ * elements*. Everything after `-Command` is treated by powershell.exe as
+ * the command string plus arguments *to that string*, so a bare
+ * `param([string]$Root)` script never binds `-Root` when the value is a
+ * separate argv element — `$Root` stayed empty and every fallback run died
+ * with exit 3 ("root unreadable") from `Get-Item 'Registry::'`. The
+ * scriptblock wrapper is what makes the trailing arguments bind to the
+ * script's `param` block, and it keeps the root out of the command text
+ * (a hostile root value can at worst fail to parse, never execute).
  */
 const WINDOWS_REGISTRY_RELATIVE_POWERSHELL = 'System32\\WindowsPowerShell\\v1.0\\powershell.exe'
 /** Exit code meaning the root key does not exist (a normal, expected outcome). */
 const WINDOWS_POWERSHELL_ROOT_ABSENT = 2
 /** Exit code meaning the root exists but a part of it could not be read. */
 const WINDOWS_POWERSHELL_ROOT_UNREADABLE = 3
-const WINDOWS_POWERSHELL_QUERY_SCRIPT = [
+/**
+ * The fallback query script. Exported for the real-spawn binding test
+ * (`tests/windows-powershell-binding.spec.ts`), which runs this exact text
+ * through a real powershell.exe so the argv-binding contract is proven
+ * against the interpreter rather than against a mock's idea of it.
+ */
+export const WINDOWS_POWERSHELL_QUERY_SCRIPT = [
   'param([string]$Root)',
   '[Console]::OutputEncoding=[Text.Encoding]::UTF8;',
   '$ErrorActionPreference="Stop";',
@@ -710,11 +738,14 @@ export function workBuddyWindowsDiscoveryTools(): WorkBuddyWindowsDiscoveryTools
       return
     }
     let settled = false
+    // See WINDOWS_POWERSHELL_QUERY_SCRIPT: the script must run inside an
+    // `& { … }` wrapper for the trailing `-Root` argv elements to bind to its
+    // `param` block; without it `$Root` stays empty and every run exits 3.
     const child = execFile(powershellPath, [
       '-NoProfile',
       '-NonInteractive',
       '-Command',
-      WINDOWS_POWERSHELL_QUERY_SCRIPT,
+      `& { ${WINDOWS_POWERSHELL_QUERY_SCRIPT} }`,
       '-Root',
       root,
     ], {

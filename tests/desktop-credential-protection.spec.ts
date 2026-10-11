@@ -15,7 +15,7 @@ import {
   sealAuthFieldForTest,
   unwrapDesktopAuthDocument,
 } from '../src/desktop-credential-protection.ts'
-import { WorkBuddyCredentialStore } from '../src/auth.ts'
+import { WorkBuddyCredentialStore, parseWorkBuddyAuth } from '../src/auth.ts'
 import { AI_VARIANT, CN_VARIANT, electronProfileFor, type WorkBuddyVariant } from '../src/variants.ts'
 
 /**
@@ -113,6 +113,34 @@ describe('desktop auth classification', () => {
       auth: { refreshToken: { '$wbEncrypted': 1, envelope: Buffer.from(JSON.stringify({ suite: 1, keyId: KEY_ID, nonce: 'AAAA' }), 'utf8').toString('base64') } },
     })
     expect(classifyDesktopAuthDocument(truncated).format).toBe('unrecognized')
+  })
+
+  it('reads a null token field as absent, not as an unreadable document', () => {
+    /*
+     * The desktop app writes \`null\` for a refresh token it has rotated away, so
+     * a \`null\` field means "no value here" — the same thing a missing field
+     * means. Classifying it as \`unrecognized\` was a live defect: the status route
+     * then reported "this file cannot be read" and the plugin refused to sign in
+     * with a credential that was perfectly usable.
+     */
+    expect(classifyDesktopAuthDocument(JSON.stringify({ auth: { accessToken: 'at', refreshToken: null } })))
+      .toEqual({ format: 'plaintext' })
+    expect(classifyDesktopAuthDocument(JSON.stringify({ auth: { accessToken: null, refreshToken: null } })))
+      .toEqual({ format: 'plaintext' })
+    // Classification and parsing must agree: whatever this accepts, the
+    // credential parser must read as a token-bearing document.
+    const usable = JSON.stringify({ auth: { accessToken: 'at', refreshToken: null } })
+    expect(classifyDesktopAuthDocument(usable).format).toBe('plaintext')
+    expect(parseWorkBuddyAuth(usable)?.accessToken).toBe('at')
+  })
+
+  it('still refuses a field that is present but neither a token nor a wrapper', () => {
+    // The distinction the null rule must not erase: a number, boolean, array,
+    // or object here is a document shape this plugin genuinely cannot read.
+    for (const value of [42, true, ['a'], { unexpected: 1 }, { '$wbEncrypted': 1 }]) {
+      expect(classifyDesktopAuthDocument(JSON.stringify({ auth: { accessToken: value } })).format)
+        .toBe('unrecognized')
+    }
   })
 
   it('accepts the flat panel shape and a mixed plaintext/encrypted document', () => {
@@ -269,9 +297,23 @@ describe('at-rest key provider', () => {
     // it serves cannot reach for another product's binary.
     vi.stubEnv(WORKBUDDY_ELECTRON_BIN_ENV, '   ')
     const cn = new WorkBuddyAtRestKeyProvider({ product: electronProfileFor(CN_VARIANT), discovery: 'macos-workbuddy' })
+    // Each platform's *measured* default, or none where no layout is verified.
+    // The CN product's Windows default is a plain join under LOCALAPPDATA, so
+    // on Windows this answers a path regardless of whether the app is actually
+    // installed — that is deliberate (discovery, not installation, is what
+    // this accessor reports) and is not the same as "undefined because the
+    // platform has no verified location", which is the Linux case below.
     if (process.platform === 'darwin') {
       expect(cn.helperPath()).toBe('/Applications/WorkBuddy.app/Contents/MacOS/Electron')
+    } else if (process.platform === 'win32') {
+      const localAppData = process.env.LOCALAPPDATA?.trim()
+      if (localAppData === undefined || localAppData === '') {
+        expect(cn.helperPath()).toBeUndefined()
+      } else {
+        expect(cn.helperPath()).toBe(join(localAppData, 'Programs', 'WorkBuddy', 'WorkBuddy.exe'))
+      }
     } else {
+      // No verified default layout on this platform: never guess a path.
       expect(cn.helperPath()).toBeUndefined()
     }
     expect(new WorkBuddyAtRestKeyProvider({ product: electronProfileFor(CN_VARIANT) }).helperPath()).toBeUndefined()

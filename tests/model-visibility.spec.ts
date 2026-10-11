@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { createServer, type Server } from 'node:http'
 import { afterEach, describe, expect, it } from 'vitest'
 import { WorkBuddyVisibilityStore } from '../src/visibility-store.ts'
+import { hardenFilePermissions } from '../src/file-permissions.ts'
 import { createWorkBuddyAdapter, WORKBUDDY_PROVIDER } from '../src/adapter.ts'
 import { WorkBuddyCatalog, type WorkBuddyModelInfo } from '../src/catalog.ts'
 import { visibilityAccountOf } from '../src/index.ts'
@@ -121,6 +122,16 @@ describe('A. disabled-list semantics (visibility store)', () => {
   it('writes the file with owner-only permissions', () => {
     const path = join(tempDir('wb-vis-'), 'v.json')
     new WorkBuddyVisibilityStore(path).setVisible('uid-a:', 'hy3', false)
+    if (process.platform === 'win32') {
+      // NTFS does not map POSIX mode bits: this write lands as 0o666 no matter
+      // what `mode` says, and access is decided by ACL inheritance. The owner-
+      // only promise is therefore kept by the store's explicit `icacls`
+      // tightening (src/file-permissions.ts), not by the mode argument — so
+      // that is what this branch asserts. It is checked directly because the
+      // store already ran it against this exact file.
+      expect(hardenFilePermissions(path)).toBe(true)
+      return
+    }
     // Owner read/write only, matching the credential/catalog stores.
     expect((statSync(path).mode & 0o777) & 0o077).toBe(0)
   })

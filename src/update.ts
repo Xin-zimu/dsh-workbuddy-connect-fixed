@@ -173,7 +173,19 @@ async function fetchBounded(
   const controller = new AbortController()
   const timer = setTimeout(() => { controller.abort(new Error('update request timed out')) }, timeoutMs)
   try {
-    const response = await fetchImpl(url, { headers, signal: controller.signal })
+    // `redirect: 'manual'` for the same reason the upstream client refuses to
+    // follow one (see src/upstream.ts): a followed redirect is a request this
+    // module did not decide to make, to a host it did not choose. Nothing here
+    // carries a credential, so the exposure is smaller — but a 3xx is still not
+    // one of the two documents this checker knows how to read, and following it
+    // would let whoever answers for the registry URL point the read elsewhere.
+    const response = await fetchImpl(url, { headers, signal: controller.signal, redirect: 'manual' })
+    // A never-followed redirect is not a document: report it exactly as the
+    // status it carried, so the caller degrades to `unavailable` rather than
+    // trying to parse a redirect body.
+    if (response.status >= 300 && response.status < 400) {
+      return { response, text: '' }
+    }
     const text = await readBoundedText(response, maxBytes)
     return { response, text }
   } finally {

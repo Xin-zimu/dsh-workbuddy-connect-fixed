@@ -22,6 +22,7 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { writeFileAtomic } from '@deepseek-ai/dsh-atomic-write'
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
+import { hardenFilePermissions } from './file-permissions.ts'
 
 /**
  * Last-resort UA version.
@@ -134,6 +135,7 @@ export async function resolveAppVersion(options: ResolveAppVersionOptions = {}):
         `${JSON.stringify({ version: installed.version, bundle: installed.bundle, observedAt: Date.now() }, null, 2)}\n`,
         { mode: 0o600, dirMode: 0o700 },
       )
+      hardenFilePermissions(path)
     } catch {
       // A read-only home is not a reason to serve no catalog.
     }

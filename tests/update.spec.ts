@@ -72,6 +72,39 @@ describe('the npm judgement', () => {
     expect(result).toMatchObject({ status: 'unavailable', reason })
   })
 
+  it('refuses to follow a redirect instead of reading the redirect target', async () => {
+    // A 3xx is not one of the two documents this checker understands. Following
+    // it would let whoever answers for the registry URL point the read at a
+    // host they choose, so the request is issued with redirect: 'manual' and a
+    // redirect answer degrades to unavailable.
+    const seen: Array<RequestInit | undefined> = []
+    const fetchImpl: WorkBuddyUpdateFetch = async (_input, init) => {
+      seen.push(init)
+      return new Response('', { status: 302, headers: { location: 'https://evil.example/dist-tags' } })
+    }
+    const result = await checkWorkBuddyUpdate({ currentVersion: '0.6.3', fetchImpl })
+    expect(result).toMatchObject({ status: 'unavailable', reason: 'registry-unavailable' })
+    // Every request must carry the manual policy, or the platform default would
+    // silently follow it for us.
+    expect(seen).not.toHaveLength(0)
+    for (const init of seen) expect(init?.redirect).toBe('manual')
+  })
+
+  it('issues every request with redirect: manual, including the enrichment', async () => {
+    const seen: Array<RequestInit | undefined> = []
+    const fetchImpl: WorkBuddyUpdateFetch = async (input, init) => {
+      seen.push(init)
+      if (input === WORKBUDDY_UPDATE_NPM_METADATA_URL) return jsonResponse({ 'dist-tags': { latest: '0.6.4' } })
+      return jsonResponse([releaseEntry('v0.6.4')])
+    }
+    await checkWorkBuddyUpdate({ currentVersion: '0.6.3', fetchImpl })
+    // Both upstreams are contactable through this one seam, so both must be
+    // covered — a policy applied only to the first request would leave the
+    // second free to follow one.
+    expect(seen.length).toBeGreaterThanOrEqual(2)
+    for (const init of seen) expect(init?.redirect).toBe('manual')
+  })
+
   it('rejects an oversized registry body while streaming', async () => {
     // The padding is real body text, not a header claim: the reader must hit
     // the cap while consuming the stream.

@@ -23,6 +23,7 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { writeFileAtomic } from '@deepseek-ai/dsh-atomic-write'
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
+import { hardenFilePermissions } from './file-permissions.ts'
 import {
   FALLBACK_APP_VERSION,
   readBundleVersion,
@@ -230,6 +231,7 @@ async function resolveCnIdentity(options: ResolveChatIdentityOptions): Promise<C
         `${JSON.stringify({ version: identity.clientVersion, observedAt: Date.now() }, null, 2)}\n`,
         { mode: 0o600, dirMode: 0o700 },
       )
+      hardenFilePermissions(savedPath)
     } catch {
       // Identity resolved; losing the memory of it is not a failure.
     }

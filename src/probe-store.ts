@@ -19,6 +19,7 @@ import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
+import { hardenFilePermissions } from './file-permissions.ts'
 import type { WorkBuddyModelInfo } from './catalog.ts'
 import type { WorkBuddyEffort } from './upstream.ts'
 
@@ -292,6 +293,8 @@ export class WorkBuddyProbeStore {
       const temporary = resolve(`${this.path}.tmp`)
       writeFileSync(temporary, `${JSON.stringify(document, null, 2)}\n`, { mode: 0o600 })
       renameSync(temporary, this.path)
+      // POSIX mode is carried by the rename; Windows needs the explicit ACL.
+      hardenFilePermissions(this.path)
     } catch {
       // A state file that cannot be written must not take the plugin down: the
       // worst case is that the observation is not remembered.

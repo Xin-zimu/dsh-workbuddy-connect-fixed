@@ -870,3 +870,261 @@ describe('auth-failure classification beside the status-note policy (PR #58 revi
     expect(classifyUpstreamError(200, JSON.stringify({ code: 12153 }))).toBe('session_dead')
   })
 })
+
+/**
+ * Regression coverage for the three defects fixed in `src/upstream.ts`.
+ *
+ * 1. A rate limiter whose body carries a credit word must not be read as
+ *    exhausted credit — that reported a permanent failure (and told the user to
+ *    top up) for a transient condition.
+ * 2. No request may follow a redirect: the refresh request carries the refresh
+ *    token in a custom header undici would forward to whatever host a 302
+ *    names.
+ * 3. No response body may be read without a cap, since `.text()` buffers the
+ *    whole thing before any slice can trim it.
+ */
+
+/** A response double carrying a real (chunked) body stream, so caps are observable. */
+function streamingResponse(
+  chunks: readonly string[],
+  init: { ok?: boolean; status?: number; headers?: Record<string, string> } = {},
+): { response: Response; cancelled: () => boolean; pulled: () => number; producedBytes: () => number } {
+  const encoded = chunks.map(chunk => new TextEncoder().encode(chunk))
+  let index = 0
+  let cancelled = false
+  let produced = 0
+  const stream = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (index >= encoded.length) {
+        controller.close()
+        return
+      }
+      const chunk = encoded[index] as Uint8Array
+      controller.enqueue(chunk)
+      index += 1
+      produced += chunk.byteLength
+    },
+    cancel() {
+      cancelled = true
+    },
+  })
+  const response = {
+    ok: init.ok ?? true,
+    status: init.status ?? 200,
+    headers: new Headers(init.headers ?? {}),
+    body: stream,
+    text: () => Promise.reject(new Error('the capped reader must not call .text() on a streaming body')),
+  } as unknown as Response
+  return { response, cancelled: () => cancelled, pulled: () => index, producedBytes: () => produced }
+}
+
+/** `n` bytes of JSON-safe filler, so one chunk can stand for a huge body. */
+function filler(n: number): string {
+  return 'x'.repeat(n)
+}
+
+describe('classifyUpstreamError ordering (rate limiting is not credit exhaustion)', () => {
+  it('keeps a 429 soft_rate even when its body screams hard credit', async () => {
+    const { classifyUpstreamError } = await import('../src/upstream.ts')
+    // 'quota exceeded' is ordinary rate-limit phrasing, and it is also a hard
+    // credit marker. The status must win: reading this as hard_credit made the
+    // host stop retrying permanently and tell the user to top up credits they
+    // already had.
+    expect(classifyUpstreamError(429, 'quota exceeded')).toBe('soft_rate')
+    expect(classifyUpstreamError(429, JSON.stringify({ code: 429, msg: 'insufficient credit' }))).toBe('soft_rate')
+    expect(classifyUpstreamError(429, '积分不足')).toBe('soft_rate')
+    expect(classifyUpstreamError(429, '')).toBe('soft_rate')
+  })
+
+  it('keeps a 402 hard_credit whatever its body says', async () => {
+    const { classifyUpstreamError } = await import('../src/upstream.ts')
+    expect(classifyUpstreamError(402, 'slow down')).toBe('hard_credit')
+    expect(classifyUpstreamError(402, '')).toBe('hard_credit')
+  })
+
+  it('keeps body markers authoritative where the status states nothing', async () => {
+    const { classifyUpstreamError } = await import('../src/upstream.ts')
+    // A 403 carrying a session-dead marker is a dead session, not a client error.
+    expect(classifyUpstreamError(403, 'Offline user session not found')).toBe('session_dead')
+    expect(classifyUpstreamError(403, JSON.stringify({ code: 12153 }))).toBe('session_dead')
+    // Credit markers still classify an otherwise-uninformative status.
+    expect(classifyUpstreamError(400, 'insufficient credit')).toBe('hard_credit')
+    expect(classifyUpstreamError(200, JSON.stringify({ code: 1, msg: 'quota exceeded' }))).toBe('hard_credit')
+  })
+
+  it('never lets a body marker turn a 429 into a permanent failure', async () => {
+    // The end-to-end shape of the bug: a real chat answer of 429 whose body
+    // names credits. chatStream must hand the host soft_rate.
+    vi.stubGlobal('fetch', vi.fn(async () => fakeResponse('{"code":429,"msg":"insufficient credit"}', false, 429)))
+    const result = await new WorkBuddyUpstreamClient().chatStream(CREDENTIAL, JSON.stringify({ model: 'm', messages: [] }))
+    expect(result.ok).toBe(false)
+    if (result.ok) throw new Error('unreachable')
+    expect(result.kind).toBe('soft_rate')
+    expect(result.status).toBe(429)
+  })
+})
+
+describe('redirects are never followed', () => {
+  /** A 302 whose Location points at a host the plugin never talks to. */
+  const REDIRECT = 'https://attacker.example/collect'
+
+  it('asks every request not to follow redirects', async () => {
+    const inits: RequestInit[] = []
+    vi.stubGlobal('fetch', vi.fn(async (_url: unknown, init?: RequestInit) => {
+      inits.push(init ?? {})
+      return fakeResponse(JSON.stringify({ code: 0, msg: 'ok', data: { limitNum: 5, credit: 1 } }))
+    }))
+    const client = new WorkBuddyUpstreamClient()
+
+    await client.chatStream(CREDENTIAL, JSON.stringify({ model: 'm', messages: [] }))
+    await client.refreshToken(CREDENTIAL).catch(() => undefined)
+    await client.fetchModels(CREDENTIAL).catch(() => undefined)
+    await client.fetchCredits({ ...CREDENTIAL, enterpriseId: 'ent-1' }).catch(() => undefined)
+
+    expect(inits.length).toBeGreaterThanOrEqual(4)
+    for (const init of inits) expect(init.redirect).toBe('manual')
+  })
+
+  it('refuses a refresh redirect instead of forwarding the refresh token', async () => {
+    const urls: string[] = []
+    vi.stubGlobal('fetch', vi.fn(async (url: unknown, init?: RequestInit) => {
+      urls.push(String(url))
+      expect(init?.redirect).toBe('manual')
+      // The token-bearing request is the only one made: nothing is sent to the
+      // host the redirect names.
+      expect((init?.headers as Record<string, string>)['X-Refresh-Token']).toBe('rt')
+      return { ok: false, status: 302, headers: new Headers({ Location: REDIRECT }) } as unknown as Response
+    }))
+
+    const error = await new WorkBuddyUpstreamClient().refreshToken(CREDENTIAL)
+      .then(() => undefined, (reason: unknown) => reason as Error)
+    expect(error).toBeDefined()
+    expect(error?.message).toContain('302')
+    expect(error?.message).toContain('redirect')
+    // Exactly one request, to the refresh endpoint; the redirect target is
+    // never contacted.
+    expect(urls).toEqual(['https://copilot.tencent.com/v2/plugin/auth/token/refresh'])
+  })
+
+  it('reports a chat redirect as a failure rather than a stream', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: false, status: 302, headers: new Headers({ Location: REDIRECT }),
+    } as unknown as Response)))
+
+    const result = await new WorkBuddyUpstreamClient().chatStream(CREDENTIAL, JSON.stringify({ model: 'm', messages: [] }))
+    expect(result.ok).toBe(false)
+    if (result.ok) throw new Error('unreachable')
+    expect(result.status).toBe(302)
+    expect(result.message).toContain('302')
+    expect(result.message).toContain('redirect')
+  })
+
+  it('fails the catalog on a redirect instead of parsing the redirect body', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: true, status: 200, text: () => Promise.resolve('{"models":[],"agents":[]}'),
+    } as unknown as Response)))
+
+    // Sanity: the catalog path works when nothing redirects.
+    await expect(new WorkBuddyUpstreamClient().fetchModels(CREDENTIAL)).rejects.toThrow(/cli agent/)
+
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: true, status: 301, text: () => Promise.resolve('{"code":0,"msg":"ok","data":{}}'),
+    } as unknown as Response)))
+    await expect(new WorkBuddyUpstreamClient().fetchModels(CREDENTIAL)).rejects.toThrow(/301 redirect/)
+  })
+})
+
+describe('response bodies are read with a cap', () => {
+  it('stops pulling a chat error body at the excerpt cap and cancels the rest', async () => {
+    // 100 chunks of 4 KiB (400 KiB total) against the 4096-byte excerpt cap.
+    const total = 100
+    const chunkSize = 4096
+    const { response, cancelled, pulled, producedBytes } = streamingResponse(
+      Array.from({ length: total }, () => filler(chunkSize)),
+      { ok: false, status: 500 },
+    )
+    vi.stubGlobal('fetch', vi.fn(async () => response))
+
+    const result = await new WorkBuddyUpstreamClient().chatStream(CREDENTIAL, JSON.stringify({ model: 'm', messages: [] }))
+    expect(result.ok).toBe(false)
+    if (result.ok) throw new Error('unreachable')
+    expect(result.status).toBe(500)
+    // 4096 is ERROR_BODY_LIMIT: the message is bounded by it.
+    expect(result.message).toHaveLength(4096)
+    // The read stopped at the cap — at most one further chunk may already have
+    // been queued by the stream itself — instead of buffering all 400 KiB.
+    expect(producedBytes()).toBeLessThanOrEqual(chunkSize * 2)
+    expect(pulled()).toBeLessThan(total)
+    expect(cancelled()).toBe(true)
+  })
+
+  it('caps the probe error body the same way', async () => {
+    const total = 100
+    const chunkSize = 4096
+    const { response, cancelled, producedBytes } = streamingResponse(
+      Array.from({ length: total }, () => filler(chunkSize)),
+      { ok: false, status: 500 },
+    )
+    vi.stubGlobal('fetch', vi.fn(async () => response))
+
+    const attempt = await new WorkBuddyUpstreamClient()
+      .probeEffort(CREDENTIAL, 'model-x', undefined, new AbortController().signal)
+    expect(attempt.status).toBe(500)
+    expect((attempt.detail ?? '').length).toBeLessThanOrEqual(200)
+    expect(producedBytes()).toBeLessThan(total * chunkSize)
+    expect(cancelled()).toBe(true)
+  })
+
+  it('stops pulling a JSON envelope at its own, larger cap', async () => {
+    // A document many times the cap: the read must end at the cap instead of
+    // buffering everything that follows.
+    const total = 16
+    const chunkSize = 1024 * 1024
+    const { response, cancelled, pulled, producedBytes } = streamingResponse(
+      Array.from({ length: total }, () => filler(chunkSize)),
+    )
+    vi.stubGlobal('fetch', vi.fn(async () => response))
+
+    await expect(new WorkBuddyUpstreamClient().fetchCredits(CREDENTIAL)).rejects.toThrow(/non-JSON/)
+    // The 8 MiB cap, plus at most the one chunk the stream had already queued.
+    expect(producedBytes()).toBeLessThanOrEqual(9 * chunkSize)
+    expect(pulled()).toBeLessThan(total)
+    expect(cancelled()).toBe(true)
+  })
+
+  it('still parses a normal catalog body through the capped reader', async () => {
+    const body = JSON.stringify({
+      code: 0,
+      msg: 'ok',
+      data: {
+        models: [{ id: 'm-1', name: 'Model One', maxInputTokens: 100_000, maxOutputTokens: 32_000 }],
+        agents: [{ name: 'cli', models: ['m-1'] }],
+      },
+    })
+    const { response } = streamingResponse([body])
+    vi.stubGlobal('fetch', vi.fn(async () => response))
+
+    const models = await new WorkBuddyUpstreamClient().fetchModels(CREDENTIAL)
+    expect(models.map(model => model.id)).toEqual(['m-1'])
+  })
+
+  it('reassembles a body split mid-character across chunks', async () => {
+    // '积分不足' split inside a multi-byte character: the decode must not mangle
+    // it, since the result reaches the user as the error text.
+    const bytes = new TextEncoder().encode('{"code":1,"msg":"积分不足"}')
+    const cut = 17
+    const parts = [bytes.slice(0, cut), bytes.slice(cut)]
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (const part of parts) controller.enqueue(part)
+        controller.close()
+      },
+    })
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, status: 200, body: stream } as unknown as Response)))
+
+    const error = await new WorkBuddyUpstreamClient().fetchCredits(CREDENTIAL)
+      .then(() => undefined, (reason: unknown) => reason as Error)
+    expect(error?.message).toContain('积分不足')
+  })
+})
+

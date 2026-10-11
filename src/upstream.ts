@@ -232,6 +232,17 @@ const CLIENT_UA = 'CLI/2.63.2 CodeBuddy/2.63.2'
 const JSON_TIMEOUT_MS = 30_000
 const ERROR_BODY_LIMIT = 4096
 
+/**
+ * Ceiling for a JSON envelope read.
+ *
+ * An envelope has to be read whole to be parsed — the catalog runs to tens of
+ * kilobytes — so this is not the error-excerpt cap above but a bound on how
+ * much memory a single response may claim. It is ~100x the largest document
+ * this upstream is known to send, so it only ever fires on a hostile or broken
+ * answer.
+ */
+const ENVELOPE_BODY_LIMIT = 8 * 1024 * 1024
+
 /** Insufficient-credit markers, ASCII lowercase plus the original Chinese. */
 const HARD_CREDIT_MARKERS: readonly string[] = [
   'insufficient credit', 'no credit', 'credit exhausted', 'credits exhausted', 'out of credit',
@@ -350,8 +361,25 @@ function resolveUpstreamBilling(
 /** Session-invalidation markers that mean "sign in again in the WorkBuddy app". */
 const SESSION_DEAD_MARKERS: readonly string[] = ['Offline user session not found', '12153']
 
-/** Classify an upstream failure from its HTTP status and body excerpt. */
+/**
+ * Classify an upstream failure from its HTTP status and body excerpt.
+ *
+ * Order is the whole point. The three statuses that state their own class
+ * (**402** payment required, **401** auth failure, **429** rate limiting) are
+ * decided *first* and are authoritative; the body only gets a say afterwards,
+ * for the statuses where the body is the only signal (a 403, or a 200 whose
+ * envelope carries a session code).
+ *
+ * The marker scan used to run before the `429` branch, so a rate limiter whose
+ * body happened to contain a credit word — `quota exceeded` is ordinary
+ * rate-limit phrasing — was classified `hard_credit`. The host reads that as
+ * HTTP 402 semantics: it stops retrying permanently and tells the user to top
+ * up credits they already have, when the truth was transient rate limiting that
+ * a later attempt would have cleared.
+ */
 export function classifyUpstreamError(status: number, body: string): UpstreamErrorKind {
+  // 402 is the upstream's own "payment required" answer, so it means
+  // hard_credit whatever its body says.
   if (status === 402) return 'hard_credit'
   // A 401 is an auth failure whatever its body says: there is no business
   // meaning for it on this upstream, and the session-dead markers below are
@@ -359,6 +387,11 @@ export function classifyUpstreamError(status: number, body: string): UpstreamErr
   // 403). Keeping every 401 in `session_dead` preserves the `(http 401)`
   // status note the host needs to classify it as AUTH.
   if (status === 401) return 'session_dead'
+  // 429 is rate limiting whatever its body says, for the same reason: it is a
+  // transient condition, and only the upstream can decide that it is not.
+  if (status === 429) return 'soft_rate'
+  // Body-only signals from here on. These statuses carry no class of their
+  // own, so a marker is the strongest evidence available.
   const lower = body.toLowerCase()
   for (const marker of HARD_CREDIT_MARKERS) {
     if (lower.includes(marker.toLowerCase()) || body.includes(marker)) return 'hard_credit'
@@ -366,7 +399,6 @@ export function classifyUpstreamError(status: number, body: string): UpstreamErr
   for (const marker of SESSION_DEAD_MARKERS) {
     if (body.includes(marker)) return 'session_dead'
   }
-  if (status === 429) return 'soft_rate'
   if (status === 404) return 'not_found'
   if (status >= 500) return 'server'
   if (status >= 400) return 'client'
@@ -583,8 +615,111 @@ interface Envelope {
   document: Record<string, unknown>
 }
 
+/**
+ * Read at most `limit` bytes of a response body, then hang up on the rest.
+ *
+ * `response.text()` buffers the **entire** body before the caller gets to
+ * slice it, so `(await response.text()).slice(0, N)` bounds what is kept, not
+ * what is read: a hostile or broken upstream can hand over an unbounded stream
+ * and the process dies of memory exhaustion before the slice runs. This stops
+ * pulling as soon as the cap is reached and cancels the remainder, so the
+ * promise is bounded by `limit` — plus whatever one chunk carried, which the
+ * slice in the caller's message removes (and which cannot be avoided: an
+ * `N`-byte read arrives as whole chunks).
+ *
+ * A body that dies part-way through is not an error here. Every caller is
+ * building either an error excerpt or a JSON document, and a truncated answer
+ * already fails those on its own terms ("non-JSON", a parse error) — throwing a
+ * body-read error instead would replace a diagnosable upstream failure with an
+ * opaque transport one.
+ *
+ * An object without a `body` **property at all** is not a fetch Response: a
+ * real one always carries a stream, so the cap below always applies in
+ * production. The `.text()` fallback exists for in-process test doubles that
+ * model only `ok`/`status`/`text`; the retained text is still trimmed to
+ * `limit`, so the value handed to a caller is bounded either way. `null` is a
+ * genuinely empty body and is distinct from that case.
+ */
+async function readBodyText(response: Response, limit: number): Promise<string> {
+  const body: ReadableStream<Uint8Array> | null | undefined = response.body
+  if (body === undefined) return (await response.text()).slice(0, limit)
+  if (body === null) return ''
+  const reader = body.getReader()
+  const decoder = new TextDecoder()
+  let text = ''
+  let bytes = 0
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      if (value === undefined) continue
+      bytes += value.byteLength
+      // A chunk is decoded as a whole even when it crosses the cap, so a
+      // multi-byte character split across chunks is never mangled on the way
+      // in; the caller's own slice trims the excess.
+      text += decoder.decode(value, { stream: true })
+      if (bytes >= limit) break
+    }
+    return text + decoder.decode()
+  } finally {
+    // Reached on every path: the early break above leaves an unread tail, and
+    // abandoning it without cancelling keeps the connection (and the upstream's
+    // work) alive. Cancelling an already-ended body resolves as a no-op.
+    await reader.cancel().catch(() => {})
+  }
+}
+
+/** Class for a successful answer that is nonetheless unusable: a 3xx redirect. */
+class UpstreamRedirectError extends Error {
+  readonly status: number
+
+  constructor(url: string, status: number) {
+    super(`workbuddy upstream answered ${status} redirect for ${url}; refusing to follow it`)
+    this.name = 'UpstreamRedirectError'
+    this.status = status
+  }
+}
+
+/**
+ * The `fetch` init every request in this module shares.
+ *
+ * `redirect: 'manual'` is a credential rule, not tidiness. The refresh request
+ * carries the refresh token in a custom `X-Refresh-Token` header, and undici
+ * strips only `Authorization` when a redirect crosses origins — so a 302
+ * pointed at a host the attacker names forwards the refresh token verbatim, in
+ * a header no browser security model ever looks at. The same applies to the
+ * `Authorization: Bearer` these requests carry: it survives a same-origin
+ * redirect. Reading every 3xx as a failure instead closes both, because a
+ * redirect must never be followed and never be mistaken for the answer.
+ */
+function fetchInit(init: RequestInit): RequestInit {
+  return { ...init, redirect: 'manual' }
+}
+
+/**
+ * Reject an HTTP redirect before its response can be used as an answer.
+ *
+ * Called wherever a response is read, including at call sites that only test
+ * `response.ok`: with `redirect: 'manual'` a 3xx arrives as an ordinary
+ * non-ok response, and the statuses 301/302/303/307/308 are not >= 400, so a
+ * classifier alone would file an unfollowed redirect under the generic
+ * `client` bucket and report it as an upstream protocol error. A redirect is
+ * an unexpected answer of an entirely different species, so it gets its own
+ * message naming the status and the request URL.
+ */
+function rejectRedirect(response: Response, url: string): void {
+  if (response.status >= 300 && response.status < 400) throw new UpstreamRedirectError(url, response.status)
+}
+
+/** Classify a 3xx for callers that report a kind rather than throwing. */
+function redirectKind(status: number): UpstreamErrorKind {
+  // Same bucket as any other malformed upstream answer; see
+  // {@link rejectRedirect} for why it is not left to the status ladder.
+  return status >= 400 ? classifyUpstreamError(status, '') : 'client'
+}
+
 async function readEnvelope(response: Response): Promise<Envelope> {
-  const text = await response.text()
+  const text = await readBodyText(response, ENVELOPE_BODY_LIMIT)
   let parsed: unknown
   try {
     parsed = JSON.parse(text)
@@ -782,19 +917,30 @@ export class WorkBuddyUpstreamClient {
       identity = fallbackChatIdentity(region)
       userAgent = chatUserAgent(identity, region)
     }
+    const chatUrl = `${chatBase(credential)}/v2/chat/completions`
     let response: Response
     try {
-      response = await fetch(`${chatBase(credential)}/v2/chat/completions`, {
+      response = await fetch(chatUrl, fetchInit({
         method: 'POST',
         headers: { ...chatHeaders(credential, userAgent, identity.clientVersion), 'Authorization': `Bearer ${credential.accessToken}` },
         body: region === 'global' ? prepareInternationalChatBody(bodyJson) : prepareCnChatBody(bodyJson),
         ...signal === undefined ? {} : { signal },
-      })
+      }))
     } catch (error: unknown) {
       return { ok: false, status: 0, kind: 'server', message: `transport error: ${String(error)}` }
     }
+    // Checked before `ok`: a never-followed redirect is not an answer, and the
+    // response returned here is streamed straight to the host.
+    if (response.status >= 300 && response.status < 400) {
+      return {
+        ok: false,
+        status: response.status,
+        kind: redirectKind(response.status),
+        message: `workbuddy upstream answered ${response.status} redirect for ${chatUrl}; refusing to follow it`,
+      }
+    }
     if (response.ok) return { ok: true, response }
-    const text = (await response.text()).slice(0, ERROR_BODY_LIMIT)
+    const text = (await readBodyText(response, ERROR_BODY_LIMIT)).slice(0, ERROR_BODY_LIMIT)
     return {
       ok: false,
       status: response.status,
@@ -805,11 +951,15 @@ export class WorkBuddyUpstreamClient {
 
   /** POST the token-refresh endpoint; the caller merges the outcome. */
   async refreshToken(credential: WorkBuddyCredential): Promise<WorkBuddyRefreshOutcome> {
-    const response = await fetch(`${chatBase(credential)}/v2/plugin/auth/token/refresh`, {
+    // The one request that carries the refresh token, in a custom header undici
+    // would forward across origins; see {@link fetchInit}.
+    const refreshUrl = `${chatBase(credential)}/v2/plugin/auth/token/refresh`
+    const response = await fetch(refreshUrl, fetchInit({
       method: 'POST',
       headers: refreshHeaders(credential),
       signal: AbortSignal.timeout(JSON_TIMEOUT_MS),
-    })
+    }))
+    rejectRedirect(response, refreshUrl)
     const envelope = await readEnvelope(response)
     if (!response.ok || envelope.code !== 0) throw envelopeError(response.status, envelope)
     const data = typeof envelope.data === 'object' && envelope.data !== null
@@ -858,7 +1008,8 @@ export class WorkBuddyUpstreamClient {
     // injects a resolver so tests never read the real filesystem, and calling
     // the module function directly made that seam inert.
     const appVersion = international ? await this.resolveAppVersion() : undefined
-    const response = await fetch(`${chatBase(credential)}/v3/config`, {
+    const configUrl = `${chatBase(credential)}/v3/config`
+    const response = await fetch(configUrl, fetchInit({
       headers: {
         Authorization: `Bearer ${credential.accessToken}`,
         Accept: 'application/json',
@@ -870,7 +1021,8 @@ export class WorkBuddyUpstreamClient {
       signal: signal === undefined
         ? AbortSignal.timeout(JSON_TIMEOUT_MS)
         : AbortSignal.any([signal, AbortSignal.timeout(JSON_TIMEOUT_MS)]),
-    })
+    }))
+    rejectRedirect(response, configUrl)
     const envelope = await readEnvelope(response)
     if (!response.ok || envelope.code !== 0) throw envelopeError(response.status, envelope)
     // Two catalog shapes share this path. The endpoints wrap their answer in
@@ -915,7 +1067,8 @@ export class WorkBuddyUpstreamClient {
     signal?: AbortSignal,
   ): Promise<ReadonlyMap<string, readonly string[]> | undefined> {
     try {
-      const response = await fetch(`${chatBase(credential)}/console/enterprises/personal/models`, {
+      const consoleUrl = `${chatBase(credential)}/console/enterprises/personal/models`
+      const response = await fetch(consoleUrl, fetchInit({
         headers: {
           Authorization: `Bearer ${credential.accessToken}`,
           Accept: 'application/json',
@@ -926,7 +1079,8 @@ export class WorkBuddyUpstreamClient {
         signal: signal === undefined
           ? AbortSignal.timeout(JSON_TIMEOUT_MS)
           : AbortSignal.any([signal, AbortSignal.timeout(JSON_TIMEOUT_MS)]),
-      })
+      }))
+      rejectRedirect(response, consoleUrl)
       if (!response.ok) return undefined
       const envelope = await readEnvelope(response)
       const data = isObject(envelope.data) ? envelope.data : envelope.document
@@ -980,7 +1134,8 @@ export class WorkBuddyUpstreamClient {
       date.getMinutes().toString().padStart(2, '0'),
       date.getSeconds().toString().padStart(2, '0'),
     ].join(':')
-    const response = await fetch(`${billingBase(credential)}/v2/billing/meter/get-user-resource`, {
+    const resourceUrl = `${billingBase(credential)}/v2/billing/meter/get-user-resource`
+    const response = await fetch(resourceUrl, fetchInit({
       method: 'POST',
       headers: billingHeaders(credential),
       body: JSON.stringify({
@@ -992,7 +1147,8 @@ export class WorkBuddyUpstreamClient {
         PackageEndTimeRangeEnd: format(new Date(now.getTime() + 365 * 101 * 24 * 3600 * 1000)),
       }),
       signal: AbortSignal.timeout(JSON_TIMEOUT_MS),
-    })
+    }))
+    rejectRedirect(response, resourceUrl)
     const envelope = await readEnvelope(response)
     if (!response.ok || envelope.code !== 0) throw envelopeError(response.status, envelope)
     const responseWrapper = typeof envelope.data === 'object' && envelope.data !== null
@@ -1049,12 +1205,14 @@ export class WorkBuddyUpstreamClient {
    * response body may describe the account's usage.
    */
   private async fetchEnterpriseCredits(credential: WorkBuddyCredential): Promise<WorkBuddyCredits> {
-    const response = await fetch(`${CN_BILLING_BASE}/v2/billing/meter/get-enterprise-user-usage`, {
+    const enterpriseUrl = `${CN_BILLING_BASE}/v2/billing/meter/get-enterprise-user-usage`
+    const response = await fetch(enterpriseUrl, fetchInit({
       method: 'POST',
       headers: billingHeaders(credential),
       body: JSON.stringify({}),
       signal: AbortSignal.timeout(JSON_TIMEOUT_MS),
-    })
+    }))
+    rejectRedirect(response, enterpriseUrl)
     const envelope = await readEnvelope(response)
     if (!response.ok || envelope.code !== 0) throw envelopeError(response.status, envelope)
     // The official reader accepts the payload at `data.data`, `data`, or the
@@ -1168,20 +1326,32 @@ export class WorkBuddyUpstreamClient {
     }
     if (effort !== undefined) payload['reasoning_effort'] = effort
 
+    const probeUrl = `${chatBase(credential)}/v2/chat/completions`
     let response: Response
     try {
-      response = await fetch(`${chatBase(credential)}/v2/chat/completions`, {
+      response = await fetch(probeUrl, fetchInit({
         method: 'POST',
         headers: { ...chatHeaders(credential, userAgent, identity.clientVersion), 'Authorization': `Bearer ${credential.accessToken}` },
         body: JSON.stringify(payload),
         signal,
-      })
+      }))
     } catch (error: unknown) {
       return { status: 0, streamed: false, detail: `transport error: ${String(error)}` }
     }
 
+    // A redirect is never a probe answer. Reported with the status it carried,
+    // so the verdict is "unknown — the upstream redirected" rather than a
+    // capability claim read off a body that describes a different endpoint.
+    if (response.status >= 300 && response.status < 400) {
+      return {
+        status: response.status,
+        streamed: false,
+        detail: `workbuddy upstream answered ${response.status} redirect for ${probeUrl}; refusing to follow it`,
+      }
+    }
+
     if (!response.ok) {
-      const text = (await response.text()).slice(0, ERROR_BODY_LIMIT)
+      const text = (await readBodyText(response, ERROR_BODY_LIMIT)).slice(0, ERROR_BODY_LIMIT)
       return { status: response.status, streamed: false, ...errorCodeOf(text) }
     }
 

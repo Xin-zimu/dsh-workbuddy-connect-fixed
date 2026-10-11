@@ -23,6 +23,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
+import { hardenFilePermissions } from './file-permissions.ts'
 import type { WorkBuddyUpstreamModel } from './upstream.ts'
 
 /** On-disk format this reader accepts; other versions are discarded. */
@@ -162,6 +163,9 @@ export class WorkBuddyCatalogStore {
       const temporary = resolve(`${this.path}.tmp`)
       writeFileSync(temporary, `${JSON.stringify(document, null, 2)}\n`, { mode: 0o600 })
       renameSync(temporary, this.path)
+      // The rename carries the temp inode's mode, which POSIX honours; Windows
+      // needs the ACL tightened on the committed file. See file-permissions.ts.
+      hardenFilePermissions(this.path)
     } catch {
       // See set(): the served catalog does not depend on this write.
     }
