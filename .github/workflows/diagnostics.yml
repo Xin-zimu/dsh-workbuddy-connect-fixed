@@ -1,11 +1,21 @@
 name: diagnostics
+
+# Runs on every push and every PR. It used to be workflow_dispatch-only, so it
+# could not gate a pull request at all: the only trigger was a manual
+# invocation pinned to one hardcoded commit SHA.
 on:
+  push:
+  pull_request:
   workflow_dispatch:
     inputs:
       target_ref:
-        description: Commit or branch to check (record resolved SHA)
-        required: true
-        default: dfb17949cbf9ba5d93ac41c76cbe436a3a331d07
+        # A workflow_dispatch input default cannot be an expression (GitHub
+        # evaluates `default:` as a literal), so the fallback to the event's
+        # own ref lives in the `resolve target ref` step below instead of
+        # being baked in here.
+        description: Commit, branch, or tag to check; empty means the ref that triggered this run
+        required: false
+        default: ''
         type: string
 permissions:
   contents: read
@@ -23,12 +33,42 @@ jobs:
       run:
         shell: bash
     steps:
+      # Resolved before the checkout because the checkout needs the answer.
+      # `inputs.target_ref` is only populated on workflow_dispatch; on push and
+      # pull_request it is the empty string and the event's own ref is used,
+      # which is what makes this workflow work on a PR at all.
+      - name: resolve target ref
+        id: target
+        env:
+          INPUT_TARGET_REF: ${{ inputs.target_ref }}
+          EVENT_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          # Values arrive through env, never interpolated into the script
+          # body, so a crafted ref cannot inject shell commands.
+          if [ -n "${INPUT_TARGET_REF}" ]; then
+            ref="${INPUT_TARGET_REF}"
+            source='workflow_dispatch input'
+          else
+            ref="${EVENT_REF}"
+            source='triggering event'
+          fi
+          echo "ref=${ref}" >> "$GITHUB_OUTPUT"
+          echo "Resolved target ref: ${ref} (from the ${source})"
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.target_ref }}
+          ref: ${{ steps.target.outputs.ref }}
+      # pnpm 11, not 10: pnpm-workspace.yaml is a pnpm 11 config. It uses the
+      # `allowBuilds` map, which replaced `onlyBuiltDependencies` and
+      # `ignoredBuiltDependencies` in v11. pnpm 10 does not know that key,
+      # silently ignores it, and skips the @google/genai and protobufjs
+      # postinstall builds — so CI would test a dependency tree the local
+      # install never produced.
+      # The version is pinned here rather than left to package.json's
+      # `packageManager` field, which this repo does not set.
       - uses: pnpm/action-setup@v4
         with:
-          version: 10
+          version: 11
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
@@ -47,6 +87,64 @@ jobs:
         run: |
           set -o pipefail
           pnpm run check 2>&1 | tee ci-logs/check.log
+      # Committed-by-hand build output. `lib/` is what package.json ships
+      # (`files: [lib]`) and tests/version.spec.ts asserts a built bundle
+      # carries the current version, but nothing in `pnpm run check` compares
+      # a fresh build against what was committed: build runs LAST there and
+      # its output is simply left on disk. So a src/ change that was never
+      # rebuilt passes CI and only surfaces in the published tarball.
+      - name: verify committed lib/ matches a fresh build
+        # One canonical platform: the committed lib/ is a single build's
+        # output, so diffing it on four OSes would let platform-specific
+        # bundler differences masquerade as drift. Detecting "src changed,
+        # lib/ not rebuilt" needs only one.
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          set -euo pipefail
+          # Rebuild here rather than relying on `check`'s internal ordering:
+          # a guard that silently depends on another step's step order rots
+          # the moment that order changes. (tsdown runs with clean: true, so
+          # lib/ on disk is now exactly a fresh build.)
+          pnpm run build 2>&1 | tee ci-logs/build.log
+
+          # `git diff --exit-code` over the tracked files under lib/.
+          #
+          # Chosen over `git status --porcelain lib/` because porcelain mixes
+          # two different things into one non-empty string: modifications to
+          # tracked files (real drift) and the presence of untracked ones.
+          # Drift must fail on the first and not on the second, and porcelain
+          # cannot tell them apart without parsing its status columns.
+          # --exit-code also gives an unambiguous 1 for "there is a
+          # difference", with no output parsing at all.
+          #
+          # Both flags are scoped to lib/, so a dirty test file or an edited
+          # src/ (which is expected here, that is the point) cannot fail this.
+          #
+          # This assumes lib/ is tracked by git — true here (it is committed,
+          # shipped via package.json `files`, and .gitignore does not list
+          # it). If it were ever ignored, this step would pass vacuously;
+          # the untracked-files net below would then see the whole directory.
+          if git diff --exit-code -- lib/ > ci-logs/lib-drift.diff 2>&1; then
+            echo 'lib/ is in sync with a fresh build.'
+          else
+            echo '::error::lib/ is out of sync with src/ — the committed build artifacts do not match a fresh build. Run `pnpm run build` and commit the updated lib/.'
+            cat ci-logs/lib-drift.diff
+            exit 1
+          fi
+
+          # `git diff` sees tracked files only, so a build that ADDS or renames
+          # a hashed chunk would slip past it when the new name is untracked.
+          # (A rename also deletes the old chunk, which the diff above does
+          # catch, so this is the second net rather than the first.) Scoped to
+          # lib/ for the same reason.
+          untracked=$(git ls-files --others --exclude-standard -- lib/)
+          if [ -n "${untracked}" ]; then
+            echo '::error::the build produced untracked files under lib/ that are not committed:'
+            echo "${untracked}"
+            echo 'Run `pnpm run build` and commit the updated lib/.'
+            exit 1
+          fi
+          echo 'no untracked files under lib/.'
       - name: upload logs
         if: always()
         uses: actions/upload-artifact@v4

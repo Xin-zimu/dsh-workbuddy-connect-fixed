@@ -190,6 +190,30 @@ describe('issue #88: fallback triggers on ambiguous bytes only', () => {
     expect(script).toContain('param([string]$Root)')
     expect(script.indexOf('param([string]$Root)')).toBeLessThan(script.indexOf('[Console]::OutputEncoding'))
   })
+
+  it('wraps the script in a scriptblock so the separate -Root argv binds', async () => {
+    // Regression for the reviewed defect: powershell.exe treats everything
+    // after `-Command` as the command string plus arguments *to that string*,
+    // so a bare `param([string]$Root)` script leaves `$Root` empty when the
+    // value arrives as its own argv element — the script then queried
+    // `Registry::` and exited 3 on every machine that needed the #88 fallback.
+    // The `& { … }` wrapper is what binds the trailing arguments.
+    // `tests/windows-powershell-binding.spec.ts` proves this against a real
+    // powershell.exe; this pins the shape the production call must keep.
+    vi.stubEnv('SystemRoot', 'C:\\Windows')
+    const calls: { binary: string, args: string[] }[] = []
+    registryStdout(Buffer.concat([GBK_CJK]), { fallback: { stdout: '[]' }, onSpawn: (binary, args) => { calls.push({ binary, args }) } })
+    await workBuddyWindowsDiscoveryTools().queryUninstallRoot('HKCU\\Uninstall', new AbortController().signal)
+    const call = calls.find(c => /powershell/iu.test(c.binary))!
+    const commandIndex = call.args.indexOf('-Command')
+    const script = call.args[commandIndex + 1]!
+    expect(script.startsWith('& { ')).toBe(true)
+    expect(script.endsWith(' }')).toBe(true)
+    // The root still travels as its own argv element, never in the command text.
+    expect(call.args[commandIndex + 2]).toBe('-Root')
+    expect(call.args[commandIndex + 3]).toBe('HKCU\\Uninstall')
+    expect(script).not.toContain('HKCU')
+  })
 })
 
 describe('issue #88: fallback failure classification', () => {

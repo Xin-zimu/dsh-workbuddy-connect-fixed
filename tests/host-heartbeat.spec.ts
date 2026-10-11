@@ -6,17 +6,43 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 /**
  * `processStartTimeMs` imports `execFileSync` from `node:child_process`, whose
  * ESM namespace cannot be spied on. Hoisted module mock: the real module is
- * used everywhere except where a test installs fake output via
- * {@link setWmicOutput}.
+ * used everywhere except where a test scripts the child's answer here.
+ *
+ * The win32 branch now runs a PowerShell **primary** and a `wmic.exe`
+ * **fallback**, so "one canned string for every call" is no longer enough to
+ * pin the behaviour: the stage that answered, and the absolute binary each
+ * stage asked for, are both part of the contract. Hence three seams —
+ * {@link processQuery.output} (any call), {@link processQuery.handler} (answer
+ * by binary, when the two stages must disagree) and {@link processQuery.calls}
+ * (what was actually spawned). Nothing here stubs `process.platform`, so every
+ * case that exercises win32 sets it itself.
  */
-const wmic = vi.hoisted(() => ({ output: undefined as string | undefined }))
+const processQuery = vi.hoisted(() => ({
+  output: undefined as string | undefined,
+  handler: undefined as ((binary: string) => string) | undefined,
+  calls: [] as { binary: string, args: string[], options: Record<string, unknown> }[],
+  reset(): void {
+    processQuery.output = undefined
+    processQuery.handler = undefined
+    processQuery.calls = []
+  },
+}))
+
 vi.mock('node:child_process', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:child_process')>()
   return {
     ...actual,
-    execFileSync: (...args: unknown[]) => {
-      if (wmic.output !== undefined) return wmic.output
-      return (actual.execFileSync as (...a: unknown[]) => unknown)(...args)
+    execFileSync: (binary: unknown, args: unknown, options: unknown) => {
+      const binaryPath = String(binary)
+      const argv = (args ?? []) as string[]
+      processQuery.calls.push({
+        binary: binaryPath,
+        args: argv,
+        options: (options ?? {}) as Record<string, unknown>,
+      })
+      if (processQuery.handler !== undefined) return processQuery.handler(binaryPath)
+      if (processQuery.output !== undefined) return processQuery.output
+      return (actual.execFileSync as (...a: unknown[]) => unknown)(binary, args, options)
     },
   }
 })
@@ -29,16 +55,24 @@ import {
   readHostHeartbeat,
   workbuddyHostHeartbeatPath,
   writeHostHeartbeat,
+  WINDOWS_PROCESS_START_TIME_SCRIPT,
   WORKBUDDY_HOST_HEARTBEAT_FILENAME,
+  WORKBUDDY_PROCESS_QUERY_STEP_TIMEOUT_MS,
 } from '../src/host-heartbeat.ts'
 import { WORKBUDDY_CONNECT_VERSION } from '../src/version.ts'
 
 let root: string | undefined
 
+/**
+ * Real `wmic` output: a `CreationDate` header, the value, then a blank line.
+ * Shared by the win32 cases below, including the `wmic.exe` fallback stage.
+ */
+const wmicOutput = (value: string): string => `CreationDate\n${value}\n\n`
+
 afterEach(async () => {
   if (root !== undefined) await rm(root, { recursive: true, force: true })
   root = undefined
-  wmic.output = undefined
+  processQuery.reset()
   vi.restoreAllMocks()
   vi.unstubAllEnvs()
 })
@@ -92,7 +126,7 @@ describe('host heartbeat', () => {
     // to lean on is covered by the `processStartTimeMs` cases below, which
     // drive the same win32 branch with the same hoisted mock.
     vi.spyOn(process, 'platform', 'get').mockReturnValue('win32')
-    wmic.output = `CreationDate\n20260923104314.239907+480\n\n`
+    processQuery.output = `CreationDate\n20260923104314.239907+480\n\n`
     const startAtMs = processStartTimeMs(process.pid)
     expect(startAtMs).toBeDefined()
 
@@ -191,16 +225,18 @@ describe('processStartTimeMs wmic token extraction (production path)', () => {
    * with stubbed `wmic` output.
    */
 
-  /** Real wmic output: a `CreationDate` header, the value, then a blank line. */
-  const wmicOutput = (value: string): string => `CreationDate\n${value}\n\n`
 
   /**
    * Drive the real win32 branch: fake the platform, and let the hoisted
    * `node:child_process` mock hand `processStartTimeMs` this output.
+   *
+   * The same canned answer is returned for *every* child, so the PowerShell
+   * primary consumes it and the `wmic.exe` fallback is never reached; the
+   * fallback has its own cases further down.
    */
   function withWindowsWmic(output: string, run: () => void): void {
     vi.spyOn(process, 'platform', 'get').mockReturnValue('win32')
-    wmic.output = output
+    processQuery.output = output
     run()
   }
 
@@ -225,3 +261,136 @@ describe('processStartTimeMs wmic token extraction (production path)', () => {
     })
   })
 })
+
+describe('processStartTimeMs Windows branch: absolute paths and bounded subprocesses', () => {
+  /**
+   * The reviewed defect: the win32 branch spawned a bare `wmic`, which the OS
+   * resolves through PATH — user-writable, so a planted `wmic.exe` would be
+   * executed by the *host process* — and it passed no timeout, so a wedged WMI
+   * provider could hang the status CLI indefinitely. Both are pinned here.
+   *
+   * The discovery modules in this repo (`desktop-credential-protection.ts`,
+   * `file-permissions.ts`) already resolve their Windows tools absolutely from
+   * %SystemRoot%; these cases hold this module to the same rule.
+   */
+
+  it('resolves both stages from %SystemRoot% and never through PATH', () => {
+    vi.stubEnv('SystemRoot', 'C:\\Windows')
+    vi.spyOn(process, 'platform', 'get').mockReturnValue('win32')
+    // Empty answers drive the primary into the fallback, so both paths spawn.
+    processQuery.handler = () => ''
+
+    expect(processStartTimeMs(4321)).toBeUndefined()
+
+    const spawned = processQuery.calls.map(call => call.binary)
+    expect(spawned).toEqual([
+      join('C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'),
+      join('C:\\Windows', 'System32', 'wbem', 'wmic.exe'),
+    ])
+    // The literal regression: nothing is spawned by bare name.
+    for (const binary of spawned) {
+      expect(binary).not.toBe('wmic')
+      expect(binary).not.toBe('powershell')
+      expect(binary.includes('\\')).toBe(true)
+    }
+  })
+
+  it('bounds every stage with an explicit timeout and a maxBuffer', () => {
+    vi.stubEnv('SystemRoot', 'C:\\Windows')
+    vi.spyOn(process, 'platform', 'get').mockReturnValue('win32')
+    processQuery.handler = () => ''
+
+    processStartTimeMs(4321)
+
+    expect(processQuery.calls).toHaveLength(2)
+    for (const call of processQuery.calls) {
+      expect(typeof call.options.timeout).toBe('number')
+      expect(call.options.timeout).toBe(WORKBUDDY_PROCESS_QUERY_STEP_TIMEOUT_MS)
+      expect(call.options.timeout as number).toBeGreaterThan(0)
+      expect(typeof call.options.maxBuffer).toBe('number')
+      expect(call.options.windowsHide).toBe(true)
+      // stderr is drained, not piped into the host's own stderr.
+      expect(call.options.stdio).toEqual(['ignore', 'pipe', 'ignore'])
+    }
+  })
+
+  it('asks powershell.exe for the raw CIM_DATETIME, not a culture-formatted date', () => {
+    vi.stubEnv('SystemRoot', 'C:\\Windows')
+    vi.spyOn(process, 'platform', 'get').mockReturnValue('win32')
+    processQuery.handler = () => ''
+
+    processStartTimeMs(4321)
+
+    const [powershellCall] = processQuery.calls
+    expect(powershellCall).toBeDefined()
+    expect(powershellCall!.args).toContain('-NoProfile')
+    expect(powershellCall!.args).toContain('-NonInteractive')
+    // The production script verbatim, wrapped so the trailing argv binds to
+    // its param block (see WINDOWS_PROCESS_START_TIME_SCRIPT).
+    expect(powershellCall!.args).toContain(`& { ${WINDOWS_PROCESS_START_TIME_SCRIPT} }`)
+    // Get-WmiObject returns CreationDate as the DMTF string this parser is
+    // written for; Get-CimInstance would materialize a culture-rendered
+    // System.DateTime instead (measured 10/11/2026 17:10:05 under de-DE).
+    expect(WINDOWS_PROCESS_START_TIME_SCRIPT).toContain('Get-WmiObject')
+    expect(WINDOWS_PROCESS_START_TIME_SCRIPT).not.toContain('Get-CimInstance')
+    // A param block must lead the script block, and the PID is typed, so the
+    // value interpolated into the WQL filter can only be a number.
+    expect(WINDOWS_PROCESS_START_TIME_SCRIPT.startsWith('param([int]$TargetProcessId)')).toBe(true)
+    // The PID travels as its own argv element, never interpolated into the
+    // command text.
+    expect(powershellCall!.args).toContain('-TargetProcessId')
+    expect(powershellCall!.args).toContain('4321')
+    expect(powershellCall!.args[powershellCall!.args.length - 1]).toBe('4321')
+  })
+
+  it('falls back to the absolute wmic.exe when powershell.exe cannot answer', () => {
+    vi.stubEnv('SystemRoot', 'C:\\Windows')
+    vi.spyOn(process, 'platform', 'get').mockReturnValue('win32')
+    processQuery.handler = binary =>
+      /powershell/iu.test(binary) ? '' : wmicOutput('20260923104314.239907+480')
+
+    // The fallback answer is the real UTC+8 value: 10:43:14 local is 02:43:14Z.
+    expect(new Date(processStartTimeMs(4321)!).toISOString()).toBe('2026-09-23T02:43:14.000Z')
+    expect(processQuery.calls.map(call => call.binary)).toHaveLength(2)
+  })
+
+  it('prefers the primary and never spawns the fallback when it answers', () => {
+    vi.stubEnv('SystemRoot', 'C:\\Windows')
+    vi.spyOn(process, 'platform', 'get').mockReturnValue('win32')
+    processQuery.handler = binary =>
+      /powershell/iu.test(binary) ? '20260923104314.239907+330' : wmicOutput('20200101000000.000000+000')
+
+    // UTC+5:30 — proves the primary's own value was the one parsed.
+    expect(new Date(processStartTimeMs(4321)!).toISOString()).toBe('2026-09-23T05:13:14.000Z')
+    expect(processQuery.calls).toHaveLength(1)
+  })
+
+  it('returns undefined instead of resolving a tool when SystemRoot is unset', () => {
+    // No SystemRoot means no absolute path to either tool. The rule is that a
+    // tool is never reached through PATH, so the answer is "we could not tell"
+    // (plain PID liveness), never a PATH-resolved spawn.
+    vi.stubEnv('SystemRoot', '')
+    vi.spyOn(process, 'platform', 'get').mockReturnValue('win32')
+
+    expect(processStartTimeMs(4321)).toBeUndefined()
+    expect(processQuery.calls).toHaveLength(0)
+  })
+
+  it('degrades to undefined when the child fails or produces no datetime', () => {
+    vi.stubEnv('SystemRoot', 'C:\\Windows')
+    vi.spyOn(process, 'platform', 'get').mockReturnValue('win32')
+
+    // Both stages fail (spawn error / non-zero exit / timeout kill).
+    processQuery.handler = () => {
+      throw Object.assign(new Error('spawn failed'), { code: 'ENOENT' })
+    }
+    expect(processStartTimeMs(4321)).toBeUndefined()
+    expect(processQuery.calls).toHaveLength(2)
+
+    processQuery.reset()
+    // Both stages answer, but neither carries a usable token.
+    processQuery.output = 'garbage'
+    expect(processStartTimeMs(4321)).toBeUndefined()
+  })
+})
+
