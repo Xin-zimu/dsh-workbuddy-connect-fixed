@@ -5,6 +5,17 @@ import { FALLBACK_WORKBUDDY_AI_MODELS, FALLBACK_WORKBUDDY_MODELS } from '../src/
 import { WorkBuddyPluginCard, type WorkBuddyCardVariant } from '../src/client/WorkBuddyPluginCard.tsx'
 import { WorkBuddyProbeControl, type WorkBuddyProbeControlProps } from '../src/client/WorkBuddyProbeControl.tsx'
 import { en } from '../src/client/locales.ts'
+import { WORKBUDDY_PROBE_KEYS_GLOBAL } from '../src/client-key.ts'
+
+/**
+ * Hand the page the probe keys the boot document would inject (#4). The keys
+ * no longer ride the status body, so a fixture that still set `probeKey`
+ * would leave every write unauthenticated and the controls inert.
+ */
+function injectProbeKeys(keys: Record<string, string>): void {
+  ;(globalThis as Record<string, unknown>)[WORKBUDDY_PROBE_KEYS_GLOBAL] = keys
+}
+
 
 /**
  * Regression tests for the browser-half defects confirmed in
@@ -141,7 +152,6 @@ function signedInStatus(overrides: Record<string, unknown> = {}): Record<string,
   return {
     status: 'signed-in',
     nickname: 'nick',
-    probeKey: 'test-key',
     credits: { total: 15, accounts: [] },
     models: [],
     ...overrides,
@@ -160,6 +170,7 @@ beforeEach(() => {
   writeReply = { ok: true, body: {} }
   stubFetch()
   stubWindow()
+  injectProbeKeys({ workbuddy: 'test-key', 'workbuddy-ai': 'test-key' })
 })
 
 afterEach(() => {

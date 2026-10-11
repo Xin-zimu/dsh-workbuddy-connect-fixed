@@ -14,11 +14,24 @@ import type { WorkBuddyUpstreamClient } from './upstream.ts'
 import { normalizeCredits } from './upstream.ts'
 import type { WorkBuddyModelInfo } from './catalog.ts'
 import { hostIsLoopback, originIsLoopback } from './loopback.ts'
+import { RouteCache } from './route-cache.ts'
 import { WORKBUDDY_STATUS_PATH } from './status-paths.ts'
-import type { WorkBuddyWebCatalog, WorkBuddyWebModelBadge, WorkBuddyWebProbeSection, WorkBuddyWebStatus, WorkBuddyWebVisibilitySection } from './status-paths.ts'
+import type { WorkBuddyWebCatalog, WorkBuddyWebCredits, WorkBuddyWebModelBadge, WorkBuddyWebProbeSection, WorkBuddyWebStatus, WorkBuddyWebVisibilitySection } from './status-paths.ts'
 
 export { WORKBUDDY_STATUS_PATH } from './status-paths.ts'
 export type { WorkBuddyWebStatus } from './status-paths.ts'
+
+/**
+ * How long one billing answer is served to every caller of the status route.
+ *
+ * The route cannot authenticate its caller, and the card reads it on mount and
+ * on every manual refresh, so an uncached billing query is an unbounded
+ * upstream fan-out any local process can drive by looping GETs. Short enough
+ * that the balance the user is looking at is still current — a manual ↻ after
+ * this window always goes upstream — and long enough that a refresh storm maps
+ * to one billing read.
+ */
+const CREDITS_TTL_MS = 15_000
 
 /** Constructor dependencies. */
 export interface WorkBuddyStatusRouteOptions {
@@ -36,8 +49,6 @@ export interface WorkBuddyStatusRouteOptions {
    * keeps working without one in tests and headless profiles.
    */
   catalog?: () => WorkBuddyWebCatalog | undefined
-  /** In-process key authorizing probe control writes. */
-  probeKey?: string
   /**
    * International-card preference selecting larger declared context windows.
    * The getter may answer `undefined` when this host cannot persist the
@@ -53,6 +64,21 @@ export interface WorkBuddyStatusRouteOptions {
    * no visibility controls rather than a list every such account would share.
    */
   visibility?: () => WorkBuddyWebVisibilitySection | undefined
+  /**
+   * Cache key for the billing read, or `undefined` to read upstream every call.
+   *
+   * The mounted route supplies one (the document is assembled per request, but
+   * billing is not), so that an unauthenticated caller cannot drive unbounded
+   * billing traffic by looping GETs. Callers that assemble the document
+   * directly — tests, doctor, headless profiles — omit it and get a live read.
+   */
+  creditsKey?: string
+  /**
+   * TTL-bounded billing cache to read through, when the caller supplies one.
+   * Absent means "always read upstream", which is what a single direct
+   * `workBuddyWebStatus` call wants.
+   */
+  creditsCache?: RouteCache<WorkBuddyWebCredits>
   /**
    * Route path to mount. Defaults to the CN variant's path so existing callers
    * and tests keep their behaviour; the international variant passes its own.
@@ -178,8 +204,11 @@ export async function workBuddyWebStatus(
     : withVisibility
   // Probe state rides the signed-in document so the card can render the
   // consent switches and results without a second request. The control key
-  // travels with it: this response already passed the loopback guard, and the
-  // key authorizes only probe control, never credentials or completions.
+  // deliberately does NOT travel with it (#4): this route's gate is "Host is
+  // loopback, Origin is absent-or-loopback", which any local process can
+  // satisfy, so a key handed out here is a key handed to anything that can
+  // reach the port. It is delivered through the boot document instead — see
+  // {@link WORKBUDDY_PROBE_KEYS_GLOBAL}.
   let probed: WorkBuddyWebStatus = statusWithModels
   if (deps.probe !== undefined) {
     // The preference is offered only when the getter can answer a value; a
@@ -189,14 +218,19 @@ export async function workBuddyWebStatus(
     probed = {
       ...statusWithModels,
       probe: deps.probe(),
-      ...deps.probeKey === undefined ? {} : { probeKey: deps.probeKey },
       ...maximumContextWindow === undefined ? {} : { useMaximumContextWindow: maximumContextWindow },
     }
   }
   try {
     const credential = await deps.store.current()
     if (credential !== undefined) {
-      const credits = await deps.client.fetchCredits(credential)
+      // Read through the cache when one is supplied. The key is the account the
+      // credential belongs to, so an account switch can never serve the
+      // previous account's balance.
+      const key = deps.creditsKey
+      const credits = deps.creditsCache !== undefined && key !== undefined
+        ? await deps.creditsCache.read(key, () => deps.client.fetchCredits(credential))
+        : await deps.client.fetchCredits(credential)
       // `unlimited` and `cycleResetTime` ride along as-is: the card must see
       // "no cap" as its own state, and the fetch only sets them when the
       // upstream actually reported them.
@@ -212,6 +246,9 @@ export async function workBuddyWebStatus(
 export function workBuddyStatusHandler(
   deps: WorkBuddyStatusRouteOptions,
 ): (req: IncomingMessage, res: ServerResponse) => Promise<void> {
+  // One cache per mounted route: the TTL bounds how often an unauthenticated
+  // caller can spend the account's upstream rate limit through this route.
+  const credits = new RouteCache<WorkBuddyWebCredits>(CREDITS_TTL_MS)
   return async (req, res) => {
     if (req.method !== 'GET') {
       json(res, 405, { error: 'method not allowed' })
@@ -221,8 +258,29 @@ export function workBuddyStatusHandler(
       json(res, 403, { error: 'request-not-trusted' })
       return
     }
+    /*
+     * The cache key is the credential the balance belongs to, resolved from the
+     * live store on every request. That is what keeps the TTL from leaking
+     * across accounts: a sign-out or a switch to another account produces a
+     * different key, so the previous account's balance is never served under
+     * the new one. An unreadable credential yields no key, and the document
+     * then takes its ordinary error path rather than a cached answer.
+     */
+    let creditsKey: string | undefined
     try {
-      json(res, 200, await workBuddyWebStatus(deps))
+      const credential = await deps.store.current()
+      if (credential !== undefined) {
+        creditsKey = `${credential.domain}\u0000${credential.uid}\u0000${credential.accessToken}`
+      }
+    } catch {
+      // Reported by the document itself; the cache simply does not engage.
+    }
+    try {
+      json(res, 200, await workBuddyWebStatus({
+        ...deps,
+        creditsCache: credits,
+        ...creditsKey === undefined ? {} : { creditsKey },
+      }))
     } catch (error: unknown) {
       json(res, 500, { error: safeMessage(error) })
     }

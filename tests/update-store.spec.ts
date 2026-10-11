@@ -253,3 +253,79 @@ describe('route transport', () => {
     expect(calls).toEqual([WORKBUDDY_UPDATE_PATH])
   })
 })
+
+/**
+ * A forced recheck that lands while a request is in flight is queued, not
+ * dropped. Dropping it made the reminder's "Check again" button look inert
+ * whenever the user clicked during the mount's own check or the five-minute
+ * retry — the click returned immediately and nothing observable happened.
+ */
+describe('a forced recheck during an in-flight request', () => {
+  it('runs once the in-flight request settles, instead of being dropped', async () => {
+    const calls: string[] = []
+    let release: (() => void) | undefined
+    const gate = new Promise<void>(resolve => { release = resolve })
+    vi.stubGlobal('fetch', (async (input: string | URL) => {
+      calls.push(String(input))
+      // The first request parks until the test releases it, so the second call
+      // is guaranteed to arrive mid-flight.
+      if (calls.length === 1) await gate
+      return new Response(JSON.stringify(UPDATE_AVAILABLE), { status: 200, headers: { 'content-type': 'application/json' } })
+    }) as typeof fetch)
+
+    const store = new WorkBuddyUpdateStore('0.6.3')
+    const inFlight = store.refresh()
+    // The click. Deliberately not awaited yet: it must not resolve by dropping.
+    const clicked = store.refresh(true)
+    expect(calls).toHaveLength(1)
+
+    release!()
+    await inFlight
+    await clicked
+    // Two requests: the mount's, then the queued forced one.
+    expect(calls).toEqual([WORKBUDDY_UPDATE_PATH, WORKBUDDY_UPDATE_PATH])
+    expect(store.getSnapshot()).toMatchObject({ status: 'update-available' })
+    store.dispose()
+  })
+
+  it('collapses several queued forces into one extra request', async () => {
+    const calls: string[] = []
+    let release: (() => void) | undefined
+    const gate = new Promise<void>(resolve => { release = resolve })
+    vi.stubGlobal('fetch', (async (input: string | URL) => {
+      calls.push(String(input))
+      if (calls.length === 1) await gate
+      return new Response(JSON.stringify(UPDATE_AVAILABLE), { status: 200, headers: { 'content-type': 'application/json' } })
+    }) as typeof fetch)
+
+    const store = new WorkBuddyUpdateStore('0.6.3')
+    const inFlight = store.refresh()
+    const clicks = [store.refresh(true), store.refresh(true), store.refresh(true)]
+    release!()
+    await Promise.all([inFlight, ...clicks])
+    // Two forced clicks want the same thing — a fresh read — so a queue of one
+    // is correct; three extra requests would be pure waste.
+    expect(calls).toEqual([WORKBUDDY_UPDATE_PATH, WORKBUDDY_UPDATE_PATH])
+    store.dispose()
+  })
+
+  it('drops a queued force when the store is disposed in the meantime', async () => {
+    const calls: string[] = []
+    let release: (() => void) | undefined
+    const gate = new Promise<void>(resolve => { release = resolve })
+    vi.stubGlobal('fetch', (async (input: string | URL) => {
+      calls.push(String(input))
+      if (calls.length === 1) await gate
+      return new Response(JSON.stringify(UPDATE_AVAILABLE), { status: 200, headers: { 'content-type': 'application/json' } })
+    }) as typeof fetch)
+
+    const store = new WorkBuddyUpdateStore('0.6.3')
+    const inFlight = store.refresh()
+    const clicked = store.refresh(true)
+    store.dispose()
+    release!()
+    await Promise.all([inFlight, clicked])
+    // The queued read must not fire after disposal.
+    expect(calls).toHaveLength(1)
+  })
+})

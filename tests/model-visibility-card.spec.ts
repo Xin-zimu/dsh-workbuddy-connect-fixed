@@ -3,6 +3,17 @@ import { act, create, type ReactTestRenderer } from 'react-test-renderer'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { AI_CARD_VARIANT, CN_CARD_VARIANT, WorkBuddyPluginCard } from '../src/client/WorkBuddyPluginCard.tsx'
 import { en } from '../src/client/locales.ts'
+import { WORKBUDDY_PROBE_KEYS_GLOBAL } from '../src/client-key.ts'
+
+/**
+ * Hand the page the probe keys the boot document would inject (#4). The keys
+ * no longer ride the status body, so a fixture that still set `probeKey`
+ * would leave every write unauthenticated and the controls inert.
+ */
+function injectProbeKeys(keys: Record<string, string>): void {
+  ;(globalThis as Record<string, unknown>)[WORKBUDDY_PROBE_KEYS_GLOBAL] = keys
+}
+
 
 /**
  * Issue #36 card wiring, post-merge: the visibility checkboxes live inside the
@@ -44,7 +55,6 @@ describe('model visibility card controls', () => {
     statusBody = {
       status: 'signed-in',
       nickname: '昵称',
-      probeKey: 'test-key',
       // Verbatim badges: the merged table reads context and rate from the same
       // rows the checkboxes live in.
       models: MODELS.map(model => ({ ...model })),
@@ -165,6 +175,7 @@ describe('model visibility card controls', () => {
       return { ok: true, json: async () => postResponse }
     })
     vi.stubGlobal('fetch', request)
+    injectProbeKeys({ workbuddy: 'test-key', 'workbuddy-ai': 'test-key' })
     vi.stubGlobal('window', {
       setInterval: () => 1,
       clearInterval: () => {},

@@ -32,6 +32,7 @@ import { piAiVersionWarning } from './pi-ai-guard.ts'
 import { registerWorkBuddyStatusRoute } from './web-status.ts'
 import { registerWorkBuddyUpdateRoute } from './update-route.ts'
 import { createProbeKey, registerWorkBuddyProbeRoute } from './probe-route.ts'
+import { WORKBUDDY_PROBE_KEYS_GLOBAL } from './client-key.ts'
 import type { WorkBuddyModelInfo } from './catalog.ts'
 import type { WorkBuddyWebCatalog, WorkBuddyWebProbeSection } from './status-paths.ts'
 import { clearHostHeartbeat, writeHostHeartbeat } from './host-heartbeat.ts'
@@ -666,7 +667,12 @@ export function apply(ctx: Context, config: Config): void {
 
   // Same-origin routes backing each Plugin-configuration card; the webServer
   // service is optional (a headless profile serves no browser).
-  const probeKey = createProbeKey()
+  //
+  // One key per variant, never one shared between them: the key is the only
+  // thing standing between a local process and a write that spends the
+  // account's credit, so a leak through one variant's delivery must not
+  // authorize the other variant's route.
+  const probeKeys = new Map(WORKBUDDY_VARIANTS.map(variant => [variant.id, createProbeKey()]))
   let setMaximumContextWindow: ((enabled: boolean) => Promise<{ state: string; reason?: string }>) | undefined
   /**
    * Whether this host's settings service carries the 0.1.2-era section API.
@@ -760,7 +766,35 @@ export function apply(ctx: Context, config: Config): void {
     // One update route for the whole bundle: it answers this npm package's
     // public version metadata only, so it is per-plugin, not per-variant.
     registerWorkBuddyUpdateRoute(webCtx, { currentVersion: WORKBUDDY_CONNECT_VERSION })
+    // Probe keys reach the card through the boot document, never through the
+    // status body. The index is not public — @deepseek-ai/dsh-client-connection
+    // answers it only to a caller holding the launch token's browser cookie
+    // (a bare loopback GET to `/` is 401), and the desktop shell fetches these
+    // rows over an IPC channel that verifies the sender frame — so this is the
+    // one delivery route a local process cannot read by knowing the port.
+    // Emitted fresh on every index render.
+    webCtx.effect(() => webCtx.on('webserver/index-inject', table => {
+      table.push({
+        kind: 'global',
+        name: WORKBUDDY_PROBE_KEYS_GLOBAL,
+        value: Object.fromEntries(probeKeys),
+      })
+    }), 'dsh-workbuddy-connect: probe key injection')
     for (const runtime of runtimes) {
+      // Route registration is per-variant, and a variant that cannot register
+      // must not take the other one's routes down with it — the same promise
+      // {@link startVariant} keeps for the providers (and the module header
+      // makes for startup, catalog, and credential state alike). The host's
+      // `register` *throws* on a duplicate `(kind, path)` — route patterns are
+      // a composition-level contract, so a collision is a misconfiguration —
+      // and one un-guarded loop meant a single collision aborted registration
+      // for every *later* variant, so the surviving variant served nothing.
+      // Each variant is therefore guarded on its own: the failure is reported
+      // and the loop continues with the next one. (The two variants' paths are
+      // distinct constants, so this guard is for composition collisions such as
+      // a stale registration from an earlier instance of this bundle, not for
+      // the variants colliding with each other.)
+      try {
       registerWorkBuddyStatusRoute(webCtx, {
         path: runtime.variant.statusPath,
         store: runtime.store,
@@ -768,98 +802,102 @@ export function apply(ctx: Context, config: Config): void {
         models: () => runtime.catalog.current(),
         catalog: () => catalogSection(runtime),
         probe: () => probeSection(runtime, current().probeConsent === true),
-        probeKey,
         // The full per-account hidden list — stale ids included — so the card's
         // checkboxes answer exactly what the picker filter reads. Absent (and
-        // the card renders no controls) when no uid-keyed account is in effect.
+          // the card renders no controls) when no uid-keyed account is in effect.
         visibility: () => {
           const account = runtime.account()
-          return account === undefined
-            ? undefined
-            : { account, disabled: runtime.visibilityStore.disabled(account) }
+            return account === undefined
+              ? undefined
+              : { account, disabled: runtime.visibilityStore.disabled(account) }
         },
         ...runtime.variant.id === CN_VARIANT.id ? {} : {
           // Presence of this field in the document is the card's capability
           // signal, so the getter answers `undefined` — not merely `false` —
           // on a host that cannot persist the preference. See
           // {@link legacySettingsAvailable}.
-          useMaximumContextWindow: () => legacySettingsAvailable
-            ? current().useMaximumContextWindow === true
-            : undefined,
-        },
-      })
-      registerWorkBuddyProbeRoute(webCtx, {
-        path: runtime.variant.probePath,
-        probe: async modelId => {
-          // The authenticated manual endpoint is called only after per-model confirmation.
-          const result = await runtime.probeService.probe(modelId, true)
-          if (result.state === 'ok') runtime.invalidate()
-          return result
-        },
-        clear: () => { runtime.probeStore.clear(); runtime.invalidate() },
-        refresh: async () => {
-          if (stopped) return { state: 'failed', reason: 'plugin is stopping' }
-          // Re-read the credential first: the user pressed this because the list
-          // looks wrong, and a sign-in that happened since the last sweep is the
-          // common cause. Re-registering is unnecessary — visibility is what
-          // changes, and the sweep owns that.
-          let credential
-          try {
-            credential = await runtime.store.current()
-          } catch (error: unknown) {
-            // A refused credential (wrong region, unreadable file) is a report,
-            // not a crash out of the route.
-            return {
-              state: 'failed',
-              reason: error instanceof Error ? error.message.slice(0, 300) : String(error),
-            }
-          }
-          if (credential === undefined) {
-            adoptIdentity(runtime, undefined, undefined)
-            return { state: 'signed-out' }
-          }
-          const identity = credentialIdentity(credential)
-          // Same transition the sweep performs: a switch reached through the
-          // manual path must drop the previous account's data *now*, not when
-          // the fetch lands, or a failed fetch leaves those models pickable.
-          adoptIdentity(runtime, identity, visibilityAccountOf(credential))
-          await fetchCatalog(runtime, identity)
-          return runtime.catalogError === undefined
-            ? { state: 'refreshed', reason: `${runtime.catalog.current().length} models` }
-            : { state: 'failed', reason: runtime.catalogError }
-        },
-        ...runtime.variant.id === CN_VARIANT.id ? {} : {
-          setMaximumContextWindow: async enabled => {
-            if (setMaximumContextWindow === undefined) return { state: 'failed', reason: 'settings are unavailable' }
-            return setMaximumContextWindow(enabled)
+            useMaximumContextWindow: () => legacySettingsAvailable
+              ? current().useMaximumContextWindow === true
+              : undefined,
           },
-        },
-        setModelVisibility: async (modelId, visible, expectedAccount) => {
-          // Refused rather than bucketed: a signed-out variant, or a
-          // credential with no uid, has no account to key the preference by,
-          // and writing it anywhere else would let one account's hidden list
-          // answer for another.
-          const account = runtime.account()
-          if (account === undefined) {
-            return { state: 'failed', reason: 'model visibility needs a signed-in account with a stable user id' }
-          }
-          // Expected-account guard: the card names the account its checkboxes
-          // were rendered from. A card still showing account A while the
-          // desktop has already switched to B must not land A's toggle in B's
-          // bucket — refuse, and the card refreshes into B's own section.
-          if (expectedAccount !== account) {
-            return { state: 'stale-account', reason: 'the signed-in account changed' }
-          }
-          try {
-            runtime.visibilityStore.setVisible(account, modelId, visible)
-          } catch (error: unknown) {
-            // A toggle that did not persist must not be reported as saved.
-            return { state: 'failed', reason: error instanceof Error ? error.message.slice(0, 300) : String(error) }
-          }
-          runtime.invalidate()
-          return { state: 'updated' }
-        },
-      }, probeKey)
+        })
+        registerWorkBuddyProbeRoute(webCtx, {
+          path: runtime.variant.probePath,
+          probe: async modelId => {
+            // The authenticated manual endpoint is called only after per-model confirmation.
+            const result = await runtime.probeService.probe(modelId, true)
+            if (result.state === 'ok') runtime.invalidate()
+            return result
+          },
+          clear: () => { runtime.probeStore.clear(); runtime.invalidate() },
+          refresh: async () => {
+            if (stopped) return { state: 'failed', reason: 'plugin is stopping' }
+            // Re-read the credential first: the user pressed this because the list
+            // looks wrong, and a sign-in that happened since the last sweep is the
+            // common cause. Re-registering is unnecessary — visibility is what
+            // changes, and the sweep owns that.
+            let credential
+            try {
+              credential = await runtime.store.current()
+            } catch (error: unknown) {
+              // A refused credential (wrong region, unreadable file) is a report,
+              // not a crash out of the route.
+              return {
+                state: 'failed',
+                reason: error instanceof Error ? error.message.slice(0, 300) : String(error),
+              }
+            }
+            if (credential === undefined) {
+              adoptIdentity(runtime, undefined, undefined)
+              return { state: 'signed-out' }
+            }
+            const identity = credentialIdentity(credential)
+            // Same transition the sweep performs: a switch reached through the
+            // manual path must drop the previous account's data *now*, not when
+            // the fetch lands, or a failed fetch leaves those models pickable.
+            adoptIdentity(runtime, identity, visibilityAccountOf(credential))
+            await fetchCatalog(runtime, identity)
+            return runtime.catalogError === undefined
+              ? { state: 'refreshed', reason: `${runtime.catalog.current().length} models` }
+              : { state: 'failed', reason: runtime.catalogError }
+          },
+          ...runtime.variant.id === CN_VARIANT.id ? {} : {
+            setMaximumContextWindow: async enabled => {
+              if (setMaximumContextWindow === undefined) return { state: 'failed', reason: 'settings are unavailable' }
+              return setMaximumContextWindow(enabled)
+            },
+          },
+          setModelVisibility: async (modelId, visible, expectedAccount) => {
+            // Refused rather than bucketed: a signed-out variant, or a
+            // credential with no uid, has no account to key the preference by,
+            // and writing it anywhere else would let one account's hidden list
+            // answer for another.
+            const account = runtime.account()
+            if (account === undefined) {
+              return { state: 'failed', reason: 'model visibility needs a signed-in account with a stable user id' }
+            }
+            // Expected-account guard: the card names the account its checkboxes
+            // were rendered from. A card still showing account A while the
+            // desktop has already switched to B must not land A's toggle in B's
+            // bucket — refuse, and the card refreshes into B's own section.
+            if (expectedAccount !== account) {
+              return { state: 'stale-account', reason: 'the signed-in account changed' }
+            }
+            try {
+              runtime.visibilityStore.setVisible(account, modelId, visible)
+            } catch (error: unknown) {
+              // A toggle that did not persist must not be reported as saved.
+              return { state: 'failed', reason: error instanceof Error ? error.message.slice(0, 300) : String(error) }
+            }
+            runtime.invalidate()
+            return { state: 'updated' }
+          },
+        }, probeKeys.get(runtime.variant.id) ?? '')
+      } catch (error: unknown) {
+        // Logged, not rethrown: this variant's cards lose their routes and say
+        // so on the next fetch, while the other variant keeps serving.
+        ctx.logger.error(`dsh-workbuddy-connect: ${runtime.variant.displayName} web routes failed to register`, error)
+      }
     }
   })
 
@@ -1114,8 +1152,18 @@ export function apply(ctx: Context, config: Config): void {
     // means for this plugin.
     if (runtimes.some(runtime => runtime.registered)) void writeHostHeartbeat()
 
-    void syncAll()
-    const timer = setInterval(() => { void syncAll() }, credentialPollMs())
+    // Both sweeps are detached — the timer must be installed without waiting
+    // for one — so each needs its own catch: a rejected promise here would
+    // surface as an unhandled rejection, which can take the host process down
+    // instead of leaving a signed-out variant simply unsigned-in.
+    void syncAll().catch(error => {
+      ctx.logger.error('dsh-workbuddy-connect: credential sweep failed', error)
+    })
+    const timer = setInterval(() => {
+      void syncAll().catch(error => {
+        ctx.logger.error('dsh-workbuddy-connect: credential sweep failed', error)
+      })
+    }, credentialPollMs())
     timer.unref?.()
     timers.push(timer)
   })

@@ -9,6 +9,8 @@ import * as WorkBuddy from '../src/index.ts'
 import { WorkBuddyCredentialStore } from '../src/auth.ts'
 import { fingerprintModel } from '../src/probe-store.ts'
 import { FALLBACK_WORKBUDDY_MODELS } from '../src/catalog.ts'
+import { WORKBUDDY_PROBE_KEYS_GLOBAL } from '../src/client-key.ts'
+import { CN_VARIANT } from '../src/variants.ts'
 import { LegacySettingsService } from './helpers/legacy-settings.ts'
 
 /**
@@ -81,10 +83,29 @@ class FakeWebServer extends Service {
   /** Latest instance; the class is plugged per test. */
   static current: FakeWebServer | undefined
   readonly routes = new Map<string, (req: IncomingMessage, res: ServerResponse) => Promise<void>>()
-
   constructor(ctx: Context) {
     super(ctx, 'webServer')
     FakeWebServer.current = this
+  }
+
+  /**
+   * Collect the injection table exactly as the real webserver does on an index
+   * render: one emit on the cordis event bus, every subscriber pushing its
+   * current rows. Mirrors `WebServer.collectIndexInjections`, so a test
+   * reading this exercises the plugin's real subscription rather than a
+   * service-local stand-in.
+   */
+  collectInjections(): Record<string, unknown> {
+    const table: unknown[] = []
+    // `this.ctx` is the protected base-class field: the real WebServer emits
+    // through exactly this context, so the fake does too.
+    this.ctx.emit('webserver/index-inject', table as never)
+    const globals: Record<string, unknown> = {}
+    for (const row of table) {
+      const entry = row as { kind?: string; name?: string; value?: unknown }
+      if (entry.kind === 'global' && typeof entry.name === 'string') globals[entry.name] = entry.value
+    }
+    return globals
   }
 
   register(route: { kind: string; path: string; handler: (req: IncomingMessage, res: ServerResponse) => Promise<void> }): () => void {
@@ -106,6 +127,21 @@ async function serve(routes: Map<string, (req: IncomingMessage, res: ServerRespo
   return { port, close: () => new Promise<void>(resolve => { server.close(() => resolve()) }) }
 }
 
+/**
+ * The CN variant's probe key as the boot document delivers it (#4).
+ *
+ * Read through the fake webserver's injection table — the same shape the host
+ * renders into the index — so this asserts the real delivery channel rather
+ * than a test-only shortcut.
+ */
+function probeKeyFromInjections(): string {
+  const globals = FakeWebServer.current!.collectInjections()
+  const keys = globals[WORKBUDDY_PROBE_KEYS_GLOBAL] as Record<string, string> | undefined
+  const key = keys?.[CN_VARIANT.id]
+  expect(typeof key).toBe('string')
+  return key as string
+}
+
 async function boot(): Promise<Context> {
   // Shorten the credential sweep so the lifecycle transitions are observable
   // without waiting the production interval. The retry backoff is expressed in
@@ -122,6 +158,48 @@ async function boot(): Promise<Context> {
   })
   return ctx
 }
+
+describe('#4 probe keys reach the page through the boot document', () => {
+  it('injects one distinct key per variant, and none of them through the status body', async () => {
+    const root = await tempDir()
+    const cnFile = join(root, 'cn.info')
+    const aiFile = join(root, 'ai.info')
+    await writeFile(cnFile, credentialDocument('copilot.tencent.com', 'uid-a'))
+    await writeFile(aiFile, credentialDocument('www.workbuddy.ai', 'uid-ai'))
+    vi.stubEnv('DSH_HOME', root)
+    vi.stubEnv('WORKBUDDY_AUTH_FILE', cnFile)
+    vi.stubEnv('WORKBUDDY_AI_AUTH_FILE', aiFile)
+    vi.stubGlobal('fetch', vi.fn(async () => fakeResponse(catalogEnvelope('live-model', 'Live'))))
+
+    const ctx = await boot()
+    await vi.waitFor(() => {
+      expect(ctx.llm.listProviders().map(provider => provider.id)).toContain('workbuddy-ai')
+    })
+
+    // Both variants' keys arrive as one injected global, keyed by variant id.
+    const globals = FakeWebServer.current!.collectInjections()
+    const keys = globals[WORKBUDDY_PROBE_KEYS_GLOBAL] as Record<string, string> | undefined
+    expect(keys).toBeDefined()
+    expect(typeof keys!['workbuddy']).toBe('string')
+    expect(typeof keys!['workbuddy-ai']).toBe('string')
+    // Distinct, not one shared secret: a leak through one variant's delivery
+    // must not authorize the other variant's route.
+    expect(keys!['workbuddy']).not.toBe(keys!['workbuddy-ai'])
+
+    // And the read-only status route — reachable by any local process that
+    // writes a loopback Host header — carries none of them.
+    const routes = FakeWebServer.current!.routes
+    const server = await serve(routes)
+    for (const statusPath of ['/plugins/dsh-workbuddy-connect/status', '/plugins/dsh-workbuddy-connect/ai/status']) {
+      const body = await (await fetch(`http://127.0.0.1:${server.port}${statusPath}`, {
+        headers: { host: `127.0.0.1:${server.port}` },
+      })).text()
+      expect(body).not.toContain(keys!['workbuddy']!)
+      expect(body).not.toContain(keys!['workbuddy-ai']!)
+      expect(body).not.toContain('probeKey')
+    }
+  }, 30_000)
+})
 
 describe('catalog lifecycle', () => {
   it('serves a live catalog once the first fetch succeeds', async () => {
@@ -335,9 +413,11 @@ describe('catalog lifecycle', () => {
         body: JSON.stringify(body),
       })
 
-    // A's observation is live on the card before the switch.
+    // A's observation is live on the card before the switch. The key comes from
+    // the boot document, not the status body (#4): the status route must not
+    // carry it, so a test that read it from there would be pinning the leak.
     const before = await get('/plugins/dsh-workbuddy-connect/status')
-    const key = before.probeKey as string
+    const key = probeKeyFromInjections()
     expect(before.probe.results.map((r: { id: string }) => r.id)).toContain('acct-a-model')
     expect(before.catalog.source).toBe('live')
 

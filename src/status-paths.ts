@@ -293,11 +293,5 @@ export type WorkBuddyWebStatus =
     useMaximumContextWindow?: boolean
     /** Per-account hidden-model state for the card's visibility controls. */
     visibility?: WorkBuddyWebVisibilitySection
-    /**
-     * In-process key authorizing probe control writes. Handed to the card with
-     * the status document (the card is same-origin and already had to pass the
-     * loopback guard); it is never persisted and rotates per process.
-     */
-    probeKey?: string
   }
   | { status: 'error'; message: string }

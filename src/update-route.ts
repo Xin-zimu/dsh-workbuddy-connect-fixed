@@ -11,16 +11,32 @@ import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import { hostIsLoopback, originIsLoopback } from './loopback.ts'
 import { WORKBUDDY_UPDATE_PATH } from './status-paths.ts'
+import { RouteCache } from './route-cache.ts'
 import { checkWorkBuddyUpdate, WORKBUDDY_UPDATE_TIMEOUT_MS } from './update.ts'
 import type { WorkBuddyUpdateFetch, WorkBuddyUpdateResult } from './update.ts'
 
 export { WORKBUDDY_UPDATE_PATH } from './status-paths.ts'
+
+/**
+ * How long one release check is served to every caller.
+ *
+ * This route reaches npm and GitHub, and it cannot authenticate its caller, so
+ * an uncached handler lets any local process generate registry traffic by
+ * looping GETs — enough to earn a rate limit for the user's own IP. Nothing
+ * about the answer is urgent to the second: it reports published releases.
+ */
+const UPDATE_TTL_MS = 5 * 60 * 1000
 
 /** Constructor dependencies. */
 export interface WorkBuddyUpdateRouteOptions {
   currentVersion: string
   fetchImpl?: WorkBuddyUpdateFetch
   timeoutMs?: number
+  /**
+   * TTL for the release check, in milliseconds. Injectable so tests need no
+   * real delay; defaults to {@link UPDATE_TTL_MS}.
+   */
+  cacheTtlMs?: number
 }
 
 function json(res: ServerResponse, status: number, value: unknown): void {
@@ -41,6 +57,7 @@ function browserRequestAllowed(req: IncomingMessage): boolean {
 
 /** Build the route handler; the caller owns registration and disposal. */
 export function workBuddyUpdateHandler(options: WorkBuddyUpdateRouteOptions): (req: IncomingMessage, res: ServerResponse) => Promise<void> {
+  const cache = new RouteCache<WorkBuddyUpdateResult>(options.cacheTtlMs ?? UPDATE_TTL_MS)
   return async (req, res) => {
     if (req.method !== 'GET') {
       json(res, 405, { error: 'method not allowed' })
@@ -52,11 +69,13 @@ export function workBuddyUpdateHandler(options: WorkBuddyUpdateRouteOptions): (r
     }
     let result: WorkBuddyUpdateResult
     try {
-      result = await checkWorkBuddyUpdate({
+      // Keyed on the running version: a plugin upgrade must not be answered
+      // from the previous version's cached check.
+      result = await cache.read(options.currentVersion, () => checkWorkBuddyUpdate({
         currentVersion: options.currentVersion,
         ...options.fetchImpl === undefined ? {} : { fetchImpl: options.fetchImpl },
         timeoutMs: options.timeoutMs ?? WORKBUDDY_UPDATE_TIMEOUT_MS,
-      })
+      }))
     } catch {
       // The checker itself fails closed, but a thrown seam must still answer
       // a well-formed document rather than an empty 500.

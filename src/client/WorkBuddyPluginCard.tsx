@@ -11,6 +11,7 @@ import type { CSSProperties } from 'react'
 import { WORKBUDDY_AI_PROBE_PATH, WORKBUDDY_AI_STATUS_PATH, WORKBUDDY_PROBE_PATH, WORKBUDDY_STATUS_PATH, isWorkBuddySignedOutReasonCode } from '../status-paths.ts'
 import type { WorkBuddyWebCreditExpiry } from '../status-paths.ts'
 import type { WorkBuddySignedOutReasonCode, WorkBuddyWebModelBadge, WorkBuddyWebProbeSection, WorkBuddyWebStatus, WorkBuddyWebVisibilitySection } from '../status-paths.ts'
+import { workBuddyProbeKeyFor } from '../client-key.ts'
 import { isWorkBuddyWebStatus } from './status-document.ts'
 import type { WorkBuddySettingsKey } from './locales.ts'
 
@@ -700,7 +701,7 @@ function formatTokens(tokens: number): string {
  *   parameter ("this model does not check it"), never as a statement that a
  *   level is unsupported.
  */
-function ProbeSection({ probe, models, t, onDetect, onClear, busy }: {
+function ProbeSection({ probe, models, t, onDetect, onClear, busy, keyAvailable }: {
   probe: WorkBuddyWebProbeSection
   /** Catalog rows from the same status document, for candidate display names. */
   models: readonly WorkBuddyWebModelBadge[] | undefined
@@ -708,6 +709,12 @@ function ProbeSection({ probe, models, t, onDetect, onClear, busy }: {
   onDetect: (modelId: string) => void
   onClear: () => void
   busy: boolean
+  /**
+   * Whether this page holds the probe key (#4). Every action in this section
+   * goes through the key-gated control route, so without one they are disabled
+   * rather than offered and silently ignored.
+   */
+  keyAvailable: boolean
 }): React.ReactNode {
   // Which model is awaiting confirmation. Confirmation is inline for the same
   // reason the Composer entry uses a bubble: a modal alert for a one-line
@@ -780,7 +787,7 @@ function ProbeSection({ probe, models, t, onDetect, onClear, busy }: {
                       <button
                         type="button"
                         style={buttonStyle}
-                        disabled={probe.running || busy}
+                        disabled={probe.running || busy || !keyAvailable}
                         onClick={() => { setPending(id) }}
                       >
                         {/*
@@ -833,7 +840,7 @@ function ProbeSection({ probe, models, t, onDetect, onClear, busy }: {
         )}
 
       {probe.results.length === 0 ? null : (
-        <button type="button" style={buttonStyle} disabled={busy} onClick={() => { onClear() }}>
+        <button type="button" style={buttonStyle} disabled={busy || !keyAvailable} onClick={() => { onClear() }}>
           {t('probeClear')}
         </button>
       )}
@@ -1001,7 +1008,10 @@ export function WorkBuddyPluginCard({ t, variant = CN_CARD_VARIANT }: WorkBuddyP
    * than thrown away, so the reason survives the round trip.
    */
   const refreshModels = useCallback(async (): Promise<void> => {
-    const key = status?.status === 'signed-in' ? status.probeKey : undefined
+    // The key comes from the boot document, not the status body (#4): the
+    // status route's loopback gate is satisfied by any local process, so a key
+    // delivered there is a key delivered to whatever can reach the port.
+    const key = workBuddyProbeKeyFor(variant.id)
     if (key === undefined) return
     setBusy(true)
     const controller = trackController()
@@ -1048,7 +1058,8 @@ export function WorkBuddyPluginCard({ t, variant = CN_CARD_VARIANT }: WorkBuddyP
    * catalog from here.
    */
   const control = useCallback(async (action: { action: 'probe'; model: string } | { action: 'clear' } | { action: 'set-maximum-context-window'; enabled: boolean } | { action: 'set-model-visibility'; model: string; visible: boolean; account: string }): Promise<void> => {
-    const key = status?.status === 'signed-in' ? status.probeKey : undefined
+    // Per-variant, from the boot document; see `refreshModels` above.
+    const key = workBuddyProbeKeyFor(variant.id)
     if (key === undefined) return
     // A visibility toggle runs on its own per-row in-flight set so the
     // Refresh buttons keep their idle labels and the untouched rows stay
@@ -1123,6 +1134,17 @@ export function WorkBuddyPluginCard({ t, variant = CN_CARD_VARIANT }: WorkBuddyP
   }, [control])
 
   const title = t(variant.titleKey)
+  /**
+   * Whether this page holds the probe key that authorizes writes (#4).
+   *
+   * The key arrives with the boot document, so a page that was not given one —
+   * an older host, a static worker deployment — has no way to authorize a
+   * refresh, a detection, or a visibility toggle. Every control that needs it
+   * is disabled rather than left clickable: a button that silently does nothing
+   * reads as a broken plugin, and the honest signal is a button the user can
+   * see is unavailable.
+   */
+  const keyAvailable = workBuddyProbeKeyFor(variant.id) !== undefined
   /**
    * The failure the assist block covers, when this document has one. Computed
    * once so the block and the header's refresh button agree on whether the
@@ -1218,7 +1240,7 @@ export function WorkBuddyPluginCard({ t, variant = CN_CARD_VARIANT }: WorkBuddyP
                             ? ''
                             : ` · ${t('catalogAppVersion', { version: status.catalog.appVersion })}`}
                         </span>
-                        <button type="button" style={buttonStyle} disabled={busy} onClick={() => { void refreshModels() }}>
+                        <button type="button" style={buttonStyle} disabled={busy || !keyAvailable} onClick={() => { void refreshModels() }}>
                           {busy ? t('refreshingModels') : t('refreshModels')}
                         </button>
                       </div>}
@@ -1289,6 +1311,7 @@ export function WorkBuddyPluginCard({ t, variant = CN_CARD_VARIANT }: WorkBuddyP
                           models={status.models}
                           t={t}
                           busy={busy}
+                          keyAvailable={keyAvailable}
                           onDetect={confirmDetect}
                           onClear={() => { void control({ action: 'clear' }) }}
                         />

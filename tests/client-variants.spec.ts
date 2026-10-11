@@ -10,6 +10,32 @@ import {
   type WorkBuddyPluginCardProps,
 } from '../src/client/WorkBuddyPluginCard.tsx'
 import { en, zh } from '../src/client/locales.ts'
+import { WORKBUDDY_PROBE_KEYS_GLOBAL, workBuddyProbeKeyFor } from '../src/client-key.ts'
+import { WORKBUDDY_VARIANTS } from '../src/variants.ts'
+
+/**
+ * Hand the page the probe keys the boot document would inject (#4). The keys
+ * no longer ride the status body, so a fixture that still set `probeKey`
+ * would leave every write unauthenticated and the controls inert.
+ */
+function injectProbeKeys(keys: Record<string, string>): void {
+  ;(globalThis as Record<string, unknown>)[WORKBUDDY_PROBE_KEYS_GLOBAL] = keys
+}
+
+/** Every rendered `<button>` in a react-test-renderer tree, with its disabled flag. */
+function collectButtons(
+  node: unknown,
+  found: { disabled: boolean; ariaExpanded?: unknown }[] = [],
+): { disabled: boolean; ariaExpanded?: unknown }[] {
+  if (node === null || typeof node !== 'object') return found
+  const element = node as { type?: unknown; props?: Record<string, unknown>; children?: unknown[] }
+  if (element.type === 'button') {
+    found.push({ disabled: element.props?.['disabled'] === true, ariaExpanded: element.props?.['aria-expanded'] })
+  }
+  for (const child of element.children ?? []) collectButtons(child, found)
+  return found
+}
+
 
 /**
  * Two-product client behaviour. The card component and the composer control are
@@ -151,10 +177,11 @@ describe('composer control provider routing', () => {
   beforeEach(() => {
     statusBody = {
       status: 'signed-in',
-      probeKey: 'test-key',
       probe: { consent: true, running: false, candidates: ['glm-5.2'], results: [] },
     }
+    injectProbeKeys({ workbuddy: 'test-key', 'workbuddy-ai': 'test-key' })
     select('workbuddy', 'glm-5.2')
+    injectProbeKeys({ workbuddy: 'test-key', 'workbuddy-ai': 'test-key' })
     request.mockReset().mockImplementation(async () => ({ ok: true, json: async () => statusBody }))
     vi.stubGlobal('fetch', request)
     vi.stubGlobal('window', {
@@ -212,5 +239,87 @@ describe('composer control provider routing', () => {
     await mount()
     expect(view?.toJSON()).toBeNull()
     expect(request).not.toHaveBeenCalled()
+  })
+/**
+ * #4: with no key the boot document cannot authorize a write, so every
+ * key-gated control must be visibly disabled. A clickable button that silently
+ * does nothing is worse than an unavailable one — it reads as a broken plugin.
+ */
+describe('#4 controls are disabled when the page holds no probe key', () => {
+  it('disables the detections, the clear action, and the model refresh', async () => {
+    // Simulate a page the boot document gave no key: the global is absent.
+    ;(globalThis as Record<string, unknown>)[WORKBUDDY_PROBE_KEYS_GLOBAL] = undefined
+    statusBody = {
+      status: 'signed-in',
+      probe: { consent: true, running: false, candidates: ['glm-5.2'], results: [] },
+      catalog: { source: 'live', fetchedAt: Date.now() },
+    }
+    select('workbuddy', 'glm-5.2')
+    await act(async () => {
+      view = create(createElement(WorkBuddyProbeControl, { directory, t: t as WorkBuddyProbeControlProps['t'] }))
+    })
+    // Walk the rendered tree for real <button>s. Asserting on the tree (not on
+    // a JSON substring) is what makes this test bite: "the string 'disabled'
+    // appears somewhere" would pass for reasons unrelated to the key.
+    const buttons = collectButtons(view!.toJSON())
+    // The probe entry is the one key-gated control in this seat, and
+    // `aria-expanded` is what identifies it: the ↻ beside the badge also
+    // carries `aria-busy`, but it reads the status route, which needs no key.
+    //
+    // Deliberately NOT asserted over every button. The ↻ must stay enabled —
+    // it is the seat's one re-read affordance and the way the control recovers
+    // from an unreadable first read — and a Cancel or note dismiss is purely
+    // local UI that must always work whatever the host injected.
+    const probeEntry = buttons.filter(button => button.ariaExpanded !== undefined)
+    expect(probeEntry).toHaveLength(1)
+    expect(probeEntry[0]!.disabled).toBe(true)
+  })
+
+  it('enables them again once the key is present', async () => {
+    injectProbeKeys({ workbuddy: 'test-key', 'workbuddy-ai': 'test-key' })
+    statusBody = {
+      status: 'signed-in',
+      probe: { consent: true, running: false, candidates: ['glm-5.2'], results: [] },
+    }
+    select('workbuddy', 'glm-5.2')
+    await act(async () => {
+      view = create(createElement(WorkBuddyProbeControl, { directory, t: t as WorkBuddyProbeControlProps['t'] }))
+    })
+    expect(view!.toJSON()).not.toBeNull()
+  })
+})
+})
+
+/**
+ * #4: the injected probe keys are keyed by \`WorkBuddyVariant.id\`, while the
+ * card looks its key up by \`WorkBuddyCardVariant.id\`. Those are two separately
+ * declared string literals, so a rename on one side would not be a type error —
+ * it would just make \`workBuddyProbeKeyFor\` answer undefined and silently
+ * disable every probe control. This pins the two namespaces together, and lives
+ * in the client project because only it compiles the card module.
+ */
+describe('#4 card ids and injected key ids are one namespace', () => {
+  it('gives every card a variant with the same id and the same routes', () => {
+    for (const card of CARD_VARIANTS) {
+      const variant = WORKBUDDY_VARIANTS.find(candidate => candidate.id === card.id)
+      expect(variant, `no variant serves card id "${card.id}"`).toBeDefined()
+      // The card's route pair must be the variant's, or the key it presents
+      // would belong to a different route than the one it posts to.
+      expect(card.statusPath).toBe(variant!.statusPath)
+      expect(card.probePath).toBe(variant!.probePath)
+    }
+    // And every variant has a card: a variant with no card would have its key
+    // injected for nobody.
+    for (const variant of WORKBUDDY_VARIANTS) {
+      expect(CARD_VARIANTS.some(card => card.id === variant.id)).toBe(true)
+    }
+  })
+
+  it('resolves a distinct key for each id the cards actually use', () => {
+    // Built the way src/index.ts builds it, then read the way the card reads it.
+    injectProbeKeys(Object.fromEntries(WORKBUDDY_VARIANTS.map(variant => [variant.id, `key-${variant.id}`])))
+    for (const card of CARD_VARIANTS) {
+      expect(workBuddyProbeKeyFor(card.id)).toBe(`key-${card.id}`)
+    }
   })
 })

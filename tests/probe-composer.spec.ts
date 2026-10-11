@@ -3,6 +3,17 @@ import { act, create, type ReactTestRenderer } from 'react-test-renderer'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { WorkBuddyProbeControl, type WorkBuddyProbeControlProps } from '../src/client/WorkBuddyProbeControl.tsx'
 import { en, zh } from '../src/client/locales.ts'
+import { WORKBUDDY_PROBE_KEYS_GLOBAL } from '../src/client-key.ts'
+
+/**
+ * Hand the page the probe keys the boot document would inject (#4). The keys
+ * no longer ride the status body, so a fixture that still set `probeKey`
+ * would leave every write unauthenticated and the controls inert.
+ */
+function injectProbeKeys(keys: Record<string, string>): void {
+  ;(globalThis as Record<string, unknown>)[WORKBUDDY_PROBE_KEYS_GLOBAL] = keys
+}
+
 
 /**
  * Composer-entry tests. The interaction these pin down:
@@ -46,7 +57,6 @@ describe('Composer model probe', () => {
   function probeStatus(overrides: Record<string, unknown> = {}): void {
     statusBody = {
       status: 'signed-in',
-      probeKey: 'test-key',
       probe: { consent: true, running: false, candidates: ['glm-5.2', 'auto'], results: [], ...overrides },
     }
   }
@@ -80,6 +90,7 @@ describe('Composer model probe', () => {
     seenStore = new Map()
     focusHandlers = []
     intervalHandlers = []
+    injectProbeKeys({ workbuddy: 'test-key', 'workbuddy-ai': 'test-key' })
     vi.stubGlobal('window', {
       setInterval: (fn: () => void) => { intervalHandlers.push(fn); return 1 },
       clearInterval: () => {},

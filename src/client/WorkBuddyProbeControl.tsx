@@ -37,6 +37,7 @@ import { useCallback, useEffect, useId, useRef, useState, useSyncExternalStore }
 import type { CSSProperties } from 'react'
 import type { ModelDirectory } from '@deepseek-ai/dsh-client-ui-model-selection/client'
 import { CARD_VARIANTS, type WorkBuddyCardVariant, type WorkBuddyPluginCardInjected } from './WorkBuddyPluginCard.tsx'
+import { workBuddyProbeKeyFor } from '../client-key.ts'
 import { isWorkBuddyWebStatus } from './status-document.ts'
 import type { WorkBuddyWebProbeModel, WorkBuddyWebStatus } from '../status-paths.ts'
 
@@ -234,8 +235,14 @@ const noteDismissStyle: CSSProperties = {
 /**
  * The feature's static inline label. Deliberately not a state readout — see the
  * module comment.
+ *
+ * NOT a hook, and deliberately not named like one: it is called inside the
+ * shell's conditional JSX below, which would be an illegal conditional hook
+ * call if this ever read state. The value is a constant string from the
+ * injected copy table, so no hook is involved and none may be added here
+ * without first moving the call out of that branch.
  */
-function useLabel(t: WorkBuddyPluginCardInjected['t']): string {
+function probeLabel(t: WorkBuddyPluginCardInjected['t']): string {
   return t('probeLabel')
 }
 
@@ -317,7 +324,7 @@ export function WorkBuddyProbeControl({ directory, t }: WorkBuddyProbeControlPro
   // A new selection gets fresh state; a late response cannot target the new model.
   return card === undefined || selection === undefined || key === undefined
     ? null
-    : <ModelProbe key={key} model={selection.model} card={card} label={useLabel(t)} t={t} />
+    : <ModelProbe key={key} model={selection.model} card={card} label={probeLabel(t)} t={t} />
 }
 
 function ModelProbe({ model, card, label, t }: {
@@ -345,6 +352,16 @@ function ModelProbe({ model, card, label, t }: {
   const refreshingRef = useRef(false)
   const mounted = useRef(false)
   const readSeq = useRef(0)
+  /**
+   * The abort controller of the probe POST this control started, if any.
+   *
+   * A probe is a multi-second upstream round trip that spends credit, so a
+   * control that unmounts mid-flight (the user switches model or provider) must
+   * not leave the request running with nobody to render its answer — the host
+   * bounds it at 30s per effort candidate, but abandoning it here is what stops
+   * a burst of selection changes from stacking probes against the account.
+   */
+  const probeController = useRef<AbortController | undefined>(undefined)
   const tooltipId = useId()
 
   const refresh = useCallback(async (signal?: AbortSignal) => {
@@ -384,6 +401,8 @@ function ModelProbe({ model, card, label, t }: {
     return () => {
       mounted.current = false
       controller.abort()
+      probeController.current?.abort()
+      probeController.current = undefined
     }
   }, [refresh])
 
@@ -420,7 +439,10 @@ function ModelProbe({ model, card, label, t }: {
   }
 
   const probe = status?.status === 'signed-in' ? status.probe : undefined
-  const key = status?.status === 'signed-in' ? status.probeKey : undefined
+  // Delivered by the boot document rather than the status body (#4): reaching
+  // this route only requires a loopback Host header, which any local process
+  // can write, so the key must not be readable from any route's response.
+  const key = workBuddyProbeKeyFor(card.id)
   const result = status === undefined ? undefined : resultFor(status, model)
   const eligible = probe?.candidates.includes(model) === true
   // Once a model has been detected it leaves the candidate list, so keep the
@@ -443,12 +465,15 @@ function ModelProbe({ model, card, label, t }: {
     setConfirming(false)
     setBusy(true)
     setFailed(false)
+    const controller = new AbortController()
+    probeController.current = controller
     try {
       const response = await fetch(card.probePath, {
         method: 'POST',
         credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json', 'X-WorkBuddy-Probe-Key': key },
         body: JSON.stringify({ action: 'probe', model }),
+        signal: controller.signal,
       })
       const body = await response.json() as {
         state?: string; validation?: string; efforts?: unknown
@@ -470,8 +495,12 @@ function ModelProbe({ model, card, label, t }: {
       }
       void refresh().catch(() => { /* Credit/status failure does not undo a completed probe. */ })
     } catch {
-      if (mounted.current) setFailed(true)
+      // An abort is this control's own teardown, not a failed detection: the
+      // note stays as it was and no failure is reported for a request the user
+      // never got an answer to in the first place.
+      if (mounted.current && !controller.signal.aborted) setFailed(true)
     } finally {
+      if (probeController.current === controller) probeController.current = undefined
       inFlight.current = false
       if (mounted.current) setBusy(false)
     }

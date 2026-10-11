@@ -3,6 +3,17 @@ import { act, create, type ReactTestRenderer } from 'react-test-renderer'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { AI_CARD_VARIANT, WorkBuddyPluginCard } from '../src/client/WorkBuddyPluginCard.tsx'
 import { en } from '../src/client/locales.ts'
+import { WORKBUDDY_PROBE_KEYS_GLOBAL } from '../src/client-key.ts'
+
+/**
+ * Hand the page the probe keys the boot document would inject (#4). The keys
+ * no longer ride the status body, so a fixture that still set `probeKey`
+ * would leave every write unauthenticated and the controls inert.
+ */
+function injectProbeKeys(keys: Record<string, string>): void {
+  ;(globalThis as Record<string, unknown>)[WORKBUDDY_PROBE_KEYS_GLOBAL] = keys
+}
+
 
 /**
  * Card tests. The plugin card had none, which is how a shared `busy` flag ended
@@ -28,7 +39,6 @@ describe('WorkBuddy plugin card', () => {
       status: 'signed-in',
       nickname: '昵称',
       expiresAt: Date.now() + 3_600_000,
-      probeKey: 'test-key',
       credits: { total: 100, accounts: [] },
       models: [],
       probe: {
@@ -52,6 +62,7 @@ describe('WorkBuddy plugin card', () => {
       return { ok: true, json: async () => ({ state: 'ok', validation: 'non-validating', efforts: [] }) }
     })
     vi.stubGlobal('fetch', request)
+    injectProbeKeys({ workbuddy: 'test-key', 'workbuddy-ai': 'test-key' })
     vi.stubGlobal('window', {
       setInterval: () => 1,
       clearInterval: () => {},

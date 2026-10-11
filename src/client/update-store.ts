@@ -71,6 +71,8 @@ export class WorkBuddyUpdateStore {
   private request: AbortController | undefined
   private disposed = false
   private recheckTimer: ReturnType<typeof setTimeout> | undefined
+  /** A forced recheck that arrived mid-flight; see {@link refresh}. */
+  private queuedForce = false
 
   constructor(readonly currentVersion: string) {
     this.snapshot = { status: 'idle', currentVersion }
@@ -140,9 +142,25 @@ export class WorkBuddyUpdateStore {
     }
   }
 
-  /** Reuse a result for a week; force bypasses the cache. */
+  /**
+   * Reuse a result for a week; force bypasses the cache.
+   *
+   * A call that arrives while a request is already in flight is *queued*, not
+   * dropped. Dropping it was a real defect: the reminder's "Check again" button
+   * calls \`refresh(true)\`, and a click landing during the mount's own check
+   * (or during the five-minute retry) returned immediately — the button looked
+   * inert, and the user's only recourse was to click again later. The queued
+   * call runs once the in-flight one settles, and a queue of one is enough:
+   * two forced retries want the same thing, a fresh read.
+   */
   async refresh(force = false): Promise<void> {
-    if (this.disposed || this.request !== undefined) return
+    if (this.disposed) return
+    if (this.request !== undefined) {
+      // Only a forced call is worth queueing; an unforced one is satisfied by
+      // whatever the in-flight request is already fetching.
+      if (force) this.queuedForce = true
+      return
+    }
     clearTimeout(this.recheckTimer)
     this.recheckTimer = undefined
     const controller = new AbortController()
@@ -191,6 +209,13 @@ export class WorkBuddyUpdateStore {
       clearTimeout(timer)
       if (this.request === controller) this.request = undefined
     }
+    // Run a forced recheck that arrived while this one was in flight. Checked
+    // after the finally so `request` is clear and the recursion takes the
+    // ordinary path; `disposed` is re-checked by the call itself.
+    if (this.queuedForce && !this.disposed) {
+      this.queuedForce = false
+      await this.refresh(true)
+    }
   }
 
   dismiss(notice: string): void {
@@ -204,6 +229,7 @@ export class WorkBuddyUpdateStore {
 
   dispose(): void {
     this.disposed = true
+    this.queuedForce = false
     clearTimeout(this.recheckTimer)
     this.request?.abort()
     this.request = undefined
