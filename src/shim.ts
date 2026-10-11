@@ -102,8 +102,10 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
 }
 
 /**
- * Start the loopback endpoint. Requests carry any bearer; the loopback bind
- * is the boundary, and the upstream credential comes from the store alone.
+ * Start the loopback endpoint. Every request must carry this process's
+ * shared secret as a bearer (loopback alone is not a trust boundary); the
+ * upstream credential comes from the store alone and the bearer is never
+ * forwarded upstream.
  */
 export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShim {
   const { store, client, catalog } = options
@@ -210,11 +212,22 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
       return
     }
 
-    const raw = (await readBody(req)).toString('utf8')
-    const prepared = prepareChatBody(raw)
-
+    // Cancellation rides the *response's* close, registered before the body
+    // is read. `req.on('close')` after `await readBody(req)` never fires:
+    // once the request body is fully consumed the stream is already
+    // destroyed and its `close` has been emitted, so the listener would
+    // register too late and a client-side "stop" would leave the upstream
+    // request — and its billing — running. `res` closes on disconnect *and*
+    // after a normal end; the `writableEnded` guard keeps a completed
+    // response from aborting its own (already finished) upstream call.
     const controller = new AbortController()
-    req.on('close', () => controller.abort())
+    res.once('close', () => {
+      if (!res.writableEnded) controller.abort()
+    })
+
+    const raw = (await readBody(req)).toString('utf8')
+    if (controller.signal.aborted) return
+    const prepared = prepareChatBody(raw)
     const result = await client.chatStream(credential, prepared, controller.signal)
 
     if (!result.ok) {
@@ -238,20 +251,51 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
       return
     }
 
+    // A 200 with no body cannot stream anything. Ending an empty event
+    // stream here would read as a complete (empty) answer; report the
+    // upstream failure instead, while the status line can still say so.
+    if (result.response.body === null) {
+      writeOpenAIError(res, 502, 'server', 'workbuddy upstream answered 200 with an empty body')
+      return
+    }
+
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache',
       'Connection': 'keep-alive',
       'X-Accel-Buffering': 'no',
     })
+    // The completion marker can straddle chunk boundaries (`'data: [DO'` +
+    // `'NE]\n\n'`), which a per-chunk `includes` misses — and a missed
+    // marker made the error path below append a *fake* `[DONE]`, reporting
+    // a truncated answer as a complete one. A rolling ASCII-safe tail
+    // (latin1 keeps byte alignment; `[DONE]` bytes cannot appear inside a
+    // multi-byte UTF-8 sequence) detects the marker across chunks.
+    const DONE_MARKER = '[DONE]'
     let sawDone = false
+    let tail = ''
     const body = Readable.fromWeb(result.response.body as Parameters<typeof Readable.fromWeb>[0])
     body.on('data', (chunk: Buffer) => {
-      if (chunk.includes('[DONE]')) sawDone = true
+      tail = (tail + chunk.toString('latin1')).slice(-DONE_MARKER.length)
+      if (tail.includes(DONE_MARKER)) sawDone = true
     })
     body.on('error', (error: unknown) => {
       logger?.warn('dsh-workbuddy-connect: upstream stream failed mid-flight', error)
-      if (!sawDone && res.writable) res.end('data: [DONE]\n\n')
+      if (!res.writable || res.writableEnded) return
+      if (sawDone) {
+        res.end()
+        return
+      }
+      // A stream that broke before its completion marker is a truncated
+      // answer, never a finished one: end with an OpenAI-shaped in-stream
+      // error instead of the fake `[DONE]` the previous shape appended.
+      res.end(`data: ${JSON.stringify({
+        error: {
+          message: 'workbuddy upstream stream failed mid-flight',
+          type: 'server',
+          code: 'upstream_stream_error',
+        },
+      })}\n\n`)
     })
     body.pipe(res)
   }

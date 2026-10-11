@@ -1,8 +1,9 @@
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { request } from 'node:http'
+import { connect, type Socket } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { WorkBuddyCredentialStore } from '../src/auth.ts'
 import { WorkBuddyCatalog } from '../src/catalog.ts'
 import { createWorkBuddyShim, type WorkBuddyShim } from '../src/shim.ts'
@@ -309,6 +310,231 @@ describe('WorkBuddy shim', () => {
     })
     expect(res.status).toBe(401)
     expect(harness.upstreamBodies).toHaveLength(0)
+  })
+})
+
+describe('SSE lifecycle', () => {
+  /**
+   * Cancellation: the shim must abort the upstream request when the client
+   * disconnects, *including* when the disconnect happens after the request
+   * body was already fully read. `req.on('close')` registered after
+   * `await readBody(req)` never fires (the stream is destroyed and `close`
+   * already emitted), which left "stop" unable to cancel the upstream call
+   * — it kept generating and billing. The fix rides `res`'s close instead;
+   * these pins drive a real socket and observe the signal the shim passes
+   * to the upstream client.
+   */
+  it('aborts the upstream request when the client disconnects after the body was read', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'wb-shim-abort-'))
+    CLEANUP.push(() => rm(dir, { recursive: true, force: true }))
+    const desktop = join(dir, 'workbuddy-desktop.info')
+    await writeFile(desktop, JSON.stringify({
+      auth: { accessToken: 'at', refreshToken: 'rt', expiresAt: Date.now() + 3600_000, domain: 'www.codebuddy.cn' },
+      account: { uid: 'uid-1' },
+    }))
+    const signals: AbortSignal[] = []
+    const shim = createWorkBuddyShim({
+      store: new WorkBuddyCredentialStore({
+        desktopPath: desktop,
+        ownPath: join(dir, 'own.json'),
+        refresh: async () => ({ accessToken: 'unused' }),
+      }),
+      catalog: new WorkBuddyCatalog(),
+      client: {
+        async chatStream(_credential, _bodyJson, signal): Promise<WorkBuddyChatResult> {
+          if (signal !== undefined) signals.push(signal)
+          // A body that never ends: the stream stays open until the client
+          // disconnects, exactly the "user pressed stop" shape.
+          return {
+            ok: true,
+            response: new Response(
+              new ReadableStream<Uint8Array>({
+                start() { /* never enqueue; the reader stays parked */ },
+              }),
+              { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+            ),
+          }
+        },
+      },
+    })
+    await shim.ready
+    CLEANUP.push(() => shim.close())
+
+    // Raw socket: send a complete request (headers + JSON body), then hang up.
+    const port = Number(new URL(shim.baseUrl()).port)
+    const socket: Socket = connect(port, '127.0.0.1')
+    await new Promise<void>(resolve => socket.once('connect', resolve))
+    const body = JSON.stringify({ model: 'hy3', messages: [{ role: 'user', content: 'hi' }] })
+    socket.write(
+      `POST /v1/chat/completions HTTP/1.1\r\n`
+      + `Host: 127.0.0.1:${String(port)}\r\n`
+      + `Content-Type: application/json\r\n`
+      + `Authorization: Bearer ${shim.token()}\r\n`
+      + `Content-Length: ${String(Buffer.byteLength(body))}\r\n\r\n`
+      + body,
+    )
+    await vi.waitFor(() => { expect(signals.length).toBe(1) }, { timeout: 5000 })
+    const signal = signals[0]!
+    expect(signal.aborted).toBe(false)
+    socket.destroy()
+    await vi.waitFor(() => { expect(signal.aborted).toBe(true) }, { timeout: 5000 })
+  })
+
+  it('does not abort a completed stream when its response closes normally', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'wb-shim-ok-'))
+    CLEANUP.push(() => rm(dir, { recursive: true, force: true }))
+    const desktop = join(dir, 'workbuddy-desktop.info')
+    await writeFile(desktop, JSON.stringify({
+      auth: { accessToken: 'at', refreshToken: 'rt', expiresAt: Date.now() + 3600_000, domain: 'www.codebuddy.cn' },
+      account: { uid: 'uid-1' },
+    }))
+    const signals: AbortSignal[] = []
+    const shim = createWorkBuddyShim({
+      store: new WorkBuddyCredentialStore({
+        desktopPath: desktop,
+        ownPath: join(dir, 'own.json'),
+        refresh: async () => ({ accessToken: 'unused' }),
+      }),
+      catalog: new WorkBuddyCatalog(),
+      client: {
+        async chatStream(_c, _b, signal): Promise<WorkBuddyChatResult> {
+          if (signal !== undefined) signals.push(signal)
+          return {
+            ok: true,
+            response: new Response('data: [DONE]\n\n', { status: 200, headers: { 'Content-Type': 'text/event-stream' } }),
+          }
+        },
+      },
+    })
+    await shim.ready
+    CLEANUP.push(() => shim.close())
+    const response = await fetch(`${shim.baseUrl()}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', authorization: `Bearer ${shim.token()}` },
+      body: JSON.stringify({ model: 'hy3', messages: [] }),
+    })
+    expect(response.status).toBe(200)
+    expect(await response.text()).toContain('[DONE]')
+    // A completed response closing normally must not read as a cancel.
+    expect(signals[0]!.aborted).toBe(false)
+  })
+
+  it('answers 502 for a 200 upstream with no body instead of an empty stream', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'wb-shim-nobody-'))
+    CLEANUP.push(() => rm(dir, { recursive: true, force: true }))
+    const desktop = join(dir, 'workbuddy-desktop.info')
+    await writeFile(desktop, JSON.stringify({
+      auth: { accessToken: 'at', refreshToken: 'rt', expiresAt: Date.now() + 3600_000, domain: 'www.codebuddy.cn' },
+      account: { uid: 'uid-1' },
+    }))
+    const shim = createWorkBuddyShim({
+      store: new WorkBuddyCredentialStore({
+        desktopPath: desktop,
+        ownPath: join(dir, 'own.json'),
+        refresh: async () => ({ accessToken: 'unused' }),
+      }),
+      catalog: new WorkBuddyCatalog(),
+      client: {
+        async chatStream(): Promise<WorkBuddyChatResult> {
+          // `new Response(null)`: a 200 whose body is literally null — the
+          // shape that previously fell into the catch's bare res.end() and
+          // produced a fake "complete" empty stream.
+          return { ok: true, response: new Response(null, { status: 200 }) }
+        },
+      },
+    })
+    await shim.ready
+    CLEANUP.push(() => shim.close())
+    const response = await fetch(`${shim.baseUrl()}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', authorization: `Bearer ${shim.token()}` },
+      body: JSON.stringify({ model: 'hy3', messages: [] }),
+    })
+    expect(response.status).toBe(502)
+    const body = await response.json() as { error: { type: string } }
+    expect(body.error.type).toBe('server')
+  })
+
+  it('detects [DONE] split across chunks and does not append a fake one', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'wb-shim-split-'))
+    CLEANUP.push(() => rm(dir, { recursive: true, force: true }))
+    const desktop = join(dir, 'workbuddy-desktop.info')
+    await writeFile(desktop, JSON.stringify({
+      auth: { accessToken: 'at', refreshToken: 'rt', expiresAt: Date.now() + 3600_000, domain: 'www.codebuddy.cn' },
+      account: { uid: 'uid-1' },
+    }))
+    const encoder = new TextEncoder()
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode('data: {"choices":[]}\n\ndata: [DO'))
+        controller.enqueue(encoder.encode('NE]\n\n'))
+        controller.close()
+      },
+    })
+    const shim = createWorkBuddyShim({
+      store: new WorkBuddyCredentialStore({
+        desktopPath: desktop,
+        ownPath: join(dir, 'own.json'),
+        refresh: async () => ({ accessToken: 'unused' }),
+      }),
+      catalog: new WorkBuddyCatalog(),
+      client: {
+        async chatStream(): Promise<WorkBuddyChatResult> {
+          return { ok: true, response: new Response(stream, { status: 200, headers: { 'Content-Type': 'text/event-stream' } }) }
+        },
+      },
+    })
+    await shim.ready
+    CLEANUP.push(() => shim.close())
+    const response = await fetch(`${shim.baseUrl()}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', authorization: `Bearer ${shim.token()}` },
+      body: JSON.stringify({ model: 'hy3', messages: [] }),
+    })
+    const text = await response.text()
+    // Exactly one [DONE] — the marker that really arrived, not a duplicate
+    // appended by the error path because the split marker was missed.
+    expect(text.match(/\[DONE\]/gu)).toHaveLength(1)
+  })
+
+  it('ends a broken stream with an in-stream error, never a fake [DONE]', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'wb-shim-broken-'))
+    CLEANUP.push(() => rm(dir, { recursive: true, force: true }))
+    const desktop = join(dir, 'workbuddy-desktop.info')
+    await writeFile(desktop, JSON.stringify({
+      auth: { accessToken: 'at', refreshToken: 'rt', expiresAt: Date.now() + 3600_000, domain: 'www.codebuddy.cn' },
+      account: { uid: 'uid-1' },
+    }))
+    const encoder = new TextEncoder()
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":"par'))
+        controller.error(new Error('connection reset'))
+      },
+    })
+    const shim = createWorkBuddyShim({
+      store: new WorkBuddyCredentialStore({
+        desktopPath: desktop,
+        ownPath: join(dir, 'own.json'),
+        refresh: async () => ({ accessToken: 'unused' }),
+      }),
+      catalog: new WorkBuddyCatalog(),
+      client: {
+        async chatStream(): Promise<WorkBuddyChatResult> {
+          return { ok: true, response: new Response(stream, { status: 200, headers: { 'Content-Type': 'text/event-stream' } }) }
+        },
+      },
+    })
+    await shim.ready
+    CLEANUP.push(() => shim.close())
+    const response = await fetch(`${shim.baseUrl()}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', authorization: `Bearer ${shim.token()}` },
+      body: JSON.stringify({ model: 'hy3', messages: [] }),
+    })
+    const text = await response.text()
+    expect(text).not.toContain('[DONE]')
+    expect(text).toContain('upstream_stream_error')
   })
 })
 

@@ -194,7 +194,13 @@ describe('#92 cross-instance: host drives a provider built by another pi-ai copy
     } finally {
       rmSync(root, { recursive: true, force: true })
     }
-  })
+    // The default 5s budget measures this test's FIXTURE, not the hand-off it
+    // asserts: `materialiseSecondCopy` copies a whole package tree and
+    // hard-links its dependencies, which costs ~2s idle and more than 5s when
+    // the full suite is loading the machine. Timing out there would report a
+    // scheduling artifact as a cross-instance regression, which is the one
+    // thing this file exists to detect.
+  }, 30_000)
 
   it('the two copies are genuinely distinct module instances', async () => {
     const { root, dir } = materialiseSecondCopy()
@@ -217,5 +223,6 @@ describe('#92 cross-instance: host drives a provider built by another pi-ai copy
     } finally {
       rmSync(root, { recursive: true, force: true })
     }
-  })
+    // Same fixture cost as the test above.
+  }, 30_000)
 })
