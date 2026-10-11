@@ -430,7 +430,22 @@ type WorkBuddyChatResult = {
  * @returns the bare multiplier, or undefined when nothing displayable remains.
  */
 declare function normalizeCredits(credits: string | undefined): string | undefined;
-/** Classify an upstream failure from its HTTP status and body excerpt. */
+/**
+ * Classify an upstream failure from its HTTP status and body excerpt.
+ *
+ * Order is the whole point. The three statuses that state their own class
+ * (**402** payment required, **401** auth failure, **429** rate limiting) are
+ * decided *first* and are authoritative; the body only gets a say afterwards,
+ * for the statuses where the body is the only signal (a 403, or a 200 whose
+ * envelope carries a session code).
+ *
+ * The marker scan used to run before the `429` branch, so a rate limiter whose
+ * body happened to contain a credit word — `quota exceeded` is ordinary
+ * rate-limit phrasing — was classified `hard_credit`. The host reads that as
+ * HTTP 402 semantics: it stops retrying permanently and tells the user to top
+ * up credits they already have, when the truth was transient rate limiting that
+ * a later attempt would have cleared.
+ */
 declare function classifyUpstreamError(status: number, body: string): UpstreamErrorKind;
 /** Region for a login domain; an empty domain means CN (matching upstream tooling). */
 declare function regionOf(domain: string): WorkBuddyRegion;
@@ -1029,7 +1044,10 @@ declare function parseWorkBuddyAuth(text: string): WorkBuddyCredential | undefin
  * (or already expired), keep the refreshed credential in the plugin-owned
  * copy, and never write the desktop app's file. A failed refresh still
  * returns a not-yet-expired token so an unreachable refresh endpoint does
- * not take down a working session.
+ * not take down a working session — and is then backed off, so "demand-driven"
+ * cannot become "once per request". Concurrent callers share one round trip,
+ * and a refresh answer that states no lifetime still yields a credential
+ * outside the margin, so nothing here can put the store into a refresh loop.
  */
 declare class WorkBuddyCredentialStore {
   private readonly variant;
@@ -1039,6 +1057,33 @@ declare class WorkBuddyCredentialStore {
   private readonly keyProvider;
   private desktopPathOverride;
   private inflight;
+  /**
+   * Access token of the refresh that is currently in flight, when one is.
+   *
+   * {@link inflight} already coalesces callers that arrive while an attempt is
+   * running. What it cannot cover is a caller that read the credential *before*
+   * the attempt finished: by the time it looks, the attempt is over and the
+   * field is cleared, so the caller still holds the pre-refresh value and
+   * starts an attempt of its own. Naming the credential an attempt is refreshing
+   * lets such a caller be told "that is already being handled", and the re-read
+   * in {@link resolve} is what makes it answer with the refreshed copy.
+   */
+  private inflightFor;
+  /**
+   * When the next refresh attempt is allowed and which credential it was for,
+   * with the number of failures in a row that produced that window. See
+   * {@link noteRefreshFailure}.
+   */
+  private refreshNotBeforeMs;
+  private backoffCredentialToken;
+  private consecutiveRefreshFailures;
+  /**
+   * The last lifetime this store observed the upstream *state* for one
+   * credential, keyed by the pair that identifies a refresh chain (uid plus
+   * refresh token, neither of which changes on a refresh that rotates only the
+   * access token). See {@link refreshLifetimeMs}.
+   */
+  private readonly observedLifetimes;
   constructor(options: WorkBuddyStoreOptions);
   /**
    * Configuration precedence for the desktop file: the plugin's configured
@@ -1059,15 +1104,75 @@ declare class WorkBuddyCredentialStore {
   current(): Promise<WorkBuddyCredential | undefined>;
   /**
    * The credential to send upstream: {@link current}, refreshed on demand.
-   * Single-flight, so parallel requests share one refresh.
+   *
+   * Concurrent callers coalesce onto one refresh (see {@link inflightFor}),
+   * and a *failing* refresh is backed off rather than retried on every request
+   * (see {@link noteRefreshFailure}), so neither a slow endpoint nor a broken
+   * one can turn demand into a request storm.
    */
   resolve(): Promise<WorkBuddyCredential>;
   /** Read-only sign-in summary; never refreshes and never throws. */
   status(): Promise<WorkBuddyAuthStatus>;
-  /** Remove the plugin-owned copy; the desktop file is untouched. */
+  /**
+   * Remove the plugin-owned copy; the desktop file is untouched.
+   *
+   * Only the credential file is removed. The `<ownPath>.lock` sibling is
+   * *not*: it is the `wx`-created mutex `withFileLock` uses to serialize
+   * cross-process writers of this file (see
+   * `@deepseek-ai/dsh-atomic-write`), and `withFileLock` releases it by
+   * unlinking its own record. Deleting it here would break that mutual
+   * exclusion rather than speed anything up: another process may be inside the
+   * critical section holding that very inode, and a third writer would then
+   * create a *fresh* lock at the same path and enter concurrently — exactly the
+   * read-modify-write race the lock exists to prevent. A lock left behind by a
+   * crashed holder is already handled by the package: its recorded PID is
+   * probed and the lock is taken over when that process is gone. Removal is
+   * best-effort (`force`), so logging out twice is not an error.
+   */
   logout(): Promise<void>;
+  /**
+   * The in-flight refresh a caller holding `credential` may join, if any.
+   *
+   * A joiner that read the credential *before* the answer landed gets the
+   * refreshed copy from the returned promise, which is the whole point: the
+   * round trip is shared rather than repeated. Only an attempt for the *same*
+   * credential is joinable — a newer one (a re-sign-in, a copy another writer
+   * already replaced) gets its own.
+   */
+  private joinable;
   private needsRefresh;
   private refreshNow;
+  /**
+   * How long the credential a refresh just returned is good for, in
+   * milliseconds.
+   *
+   * A stated lifetime is believed and recorded as the observed lifetime of this
+   * credential. When the upstream states none the *observed* one is used, so a
+   * chain of refreshes that never states a lifetime still tracks what the
+   * server actually issues. In both cases the result is floored at the refresh
+   * margin plus a minute: the whole point of a refresh is to leave the margin
+   * that triggered it, and a lifetime that does not would make every subsequent
+   * request refresh again (the bug this exists to prevent). The fallback when
+   * nothing has been observed is {@link ASSUMED_REFRESH_LIFETIME_MS}.
+   */
+  private refreshLifetimeMs;
+  /** The credential pair a refresh chain belongs to; see {@link refreshLifetimeMs}. */
+  private lifetimeKey;
+  /** Remember the lifetime the upstream just stated, for a silent next refresh. */
+  private noteRefreshSuccess;
+  /**
+   * Record a failed refresh so the next one backs off.
+   *
+   * Without this a *failing* endpoint is hit once per upstream request: the
+   * credential stays inside the margin, so nothing about it ever changes and
+   * every call retries. The window doubles per consecutive failure — one sweep
+   * of the credential poll up to a ceiling — and only ever suppresses a retry
+   * while the stored credential is still worth serving; a caller whose token is
+   * genuinely dead still gets the refresh failure reported (see
+   * {@link refreshNow}), and a *different* credential never waits on this
+   * window at all (see {@link resolve}).
+   */
+  private noteRefreshFailure;
   private saveOwn;
   /**
    * Read the first desktop candidate that exists. Only an absent file
@@ -1095,6 +1200,20 @@ declare class WorkBuddyCredentialStore {
    * without attempting the unlock.
    */
   desktopAuthFormat(): Promise<DesktopAuthFormat>;
+  /**
+   * Read the plugin-owned copy.
+   *
+   * Only an absent file means "no plugin-owned copy". Every other failure
+   * propagates, exactly as {@link readDesktop} does for the desktop file: an
+   * EACCES or EISDIR here is a real, fixable problem — a credential file the
+   * user cannot read, or a path that is not a file at all — and reporting it as
+   * "not signed in" would send the user to sign in again while the actual fault
+   * (a bad `DSH_HOME`, a directory in the way, restrictive permissions) stayed
+   * hidden. A document that is present but carries no usable credential
+   * (unparsable, a foreign `version`, no access token) is still *absent* in the
+   * sense that matters: it names no credential, so it falls through to the
+   * desktop file rather than failing the whole read.
+   */
   private readOwn;
   /**
    * The first desktop candidate the probe would actually read from; `undefined`
@@ -1328,8 +1447,10 @@ interface WorkBuddyShimOptions {
   logger?: ShimLogger;
 }
 /**
- * Start the loopback endpoint. Requests carry any bearer; the loopback bind
- * is the boundary, and the upstream credential comes from the store alone.
+ * Start the loopback endpoint. Every request must carry this process's
+ * shared secret as a bearer (loopback alone is not a trust boundary); the
+ * upstream credential comes from the store alone and the bearer is never
+ * forwarded upstream.
  */
 declare function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShim;
 //#endregion
@@ -1619,9 +1740,14 @@ declare function readHostHeartbeat(): Promise<WorkBuddyHostHeartbeat | undefined
  * - macOS / Linux: `ps -o lstart=` prints a local-time "EEE MMM DD HH:MM:SS YYYY";
  *   `Date.parse` resolves it against the local clock, which matches how
  *   `registeredAt` (a `Date.now()` absolute value) is expressed.
- * - Windows: `wmic` prints a CIM_DATETIME `CreationDate` — local fields plus a
- *   signed minute offset (see {@link parseWmiCreationDate}); the epoch it
- *   yields is comparable to `registeredAt`.
+ * - Windows: an absolute `powershell.exe` runs
+ *   {@link WINDOWS_PROCESS_START_TIME_SCRIPT}, which prints the CIM_DATETIME
+ *   `CreationDate` — local fields plus a signed minute offset (see
+ *   {@link parseWmiCreationDate}); the epoch it yields is comparable to
+ *   `registeredAt`. If that stage yields no usable token, the absolute
+ *   `wmic.exe` path is tried (kept for hosts where WMI answers but
+ *   PowerShell does not). Both stages are bounded by
+ *   {@link WORKBUDDY_PROCESS_QUERY_STEP_TIMEOUT_MS} and neither goes through PATH.
  *
  * Failures return `undefined` so callers can fall back to plain PID liveness
  * rather than mis-report a running host as dead.
