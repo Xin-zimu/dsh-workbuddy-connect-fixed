@@ -788,7 +788,13 @@ async function asLinux<T>(options: {
     })
   })
 
-  it('skips an empty config-home file and resolves to the data-home credential', { skip: !POSIX_HOST }, async () => {
+  // Windows-gated: the fixture points XDG_CONFIG_HOME/XDG_DATA_HOME at real
+  // temp dirs. On a Windows host those are drive-letter paths, which the
+  // (correct, spec-mandated) Linux adoption rule `startsWith('/')` rejects, so
+  // the candidates fall back to the stubbed home and the file is never found.
+  // The rejection rule itself is covered cross-platform by the literal-path
+  // tests above; this round-trip needs a POSIX-form host filesystem.
+  it.skipIf(process.platform === 'win32')('skips an empty config-home file and resolves to the data-home credential', async () => {
     // The probe treats an empty file as absent and moves on; the resolved-path
     // diagnostic must agree, or doctor would name the empty config-home file
     // while authentication actually uses the data-home candidate.
@@ -814,7 +820,10 @@ async function asLinux<T>(options: {
     })
   })
 
-  it('resolves the actually-hit path when only the data home carries the file', { skip: !POSIX_HOST }, async () => {
+  // Windows-gated: same fixture shape as the empty-config-home case above —
+  // XDG overrides pointing at real temp dirs only ride the Linux branch when
+  // the host filesystem names them POSIX-style.
+  it.skipIf(process.platform === 'win32')('resolves the actually-hit path when only the data home carries the file', async () => {
     // Issue #43 diagnostics: the first *candidate* is the config home, but
     // when only the data-home copy exists, resolvedDesktopAuthPath() must
     // name it — for both variants.
@@ -840,7 +849,14 @@ async function asLinux<T>(options: {
     })
   })
 
-  it('uses translated WSL environment paths when the Windows user differs', { skip: !POSIX_HOST }, async () => {
+  // Windows-gated: the fixture writes a real credential file at a host-fs
+  // path and hands it to the WSL translation as USERPROFILE. On a Windows
+  // host that path is drive-letter form, so the (correct) translation turns
+  // it into a `/mnt/<drive>/…` path that only exists inside a WSL mount, and
+  // the resolve() round-trip cannot be backed by the host filesystem. The
+  // translation rules stay covered on macOS/Linux runners and by the
+  // string-level test below.
+  it.skipIf(process.platform === 'win32')('uses translated WSL environment paths when the Windows user differs', async () => {
     const root = await mkdtemp(join(tmpdir(), 'wb-wsl-'))
     CLEANUP.push(() => rm(root, { recursive: true, force: true }))
     const windowsProfile = join(root, 'Users', 'windows-alice')

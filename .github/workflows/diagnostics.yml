@@ -17,6 +17,12 @@ on:
         required: false
         default: ''
         type: string
+      test_scope:
+        description: full runs the whole check suite (default); windows-registry runs only the PowerShell 5.1 registry integration spec, on the Windows runners
+        required: false
+        default: full
+        type: choice
+        options: [full, windows-registry]
 permissions:
   contents: read
 jobs:
@@ -24,8 +30,12 @@ jobs:
     name: diagnostics (${{ matrix.os }}, Node ${{ matrix.node }})
     strategy:
       fail-fast: false
+      # The scoped mode needs only the Windows runners; `full` (and any
+      # dispatch that omits the input) keeps the exact original matrix.
+      # `inputs` is an allowed context for strategy.matrix, and the
+      # &&/|| fromJSON form is GitHub's documented conditional-matrix shape.
       matrix:
-        os: [macos-latest, ubuntu-latest, windows-2022, windows-2025]
+        os: ${{ inputs.test_scope == 'windows-registry' && fromJSON('["windows-2022", "windows-2025"]') || fromJSON('["macos-latest", "ubuntu-latest", "windows-2022", "windows-2025"]') }}
         node: [22]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
@@ -84,9 +94,21 @@ jobs:
           set -o pipefail
           pnpm install --frozen-lockfile 2>&1 | tee ci-logs/install.log
       - name: check
+        if: inputs.test_scope != 'windows-registry'
         run: |
           set -o pipefail
           pnpm run check 2>&1 | tee ci-logs/check.log
+      # Scoped mode: prove the real-process Windows registry integration in
+      # isolation (issues #105/#106/#107). No full suite, no file parallelism,
+      # one worker — the registry subprocesses then run without the load of a
+      # 46-file concurrent run, so the production step budgets measure the
+      # step itself, not runner contention.
+      - name: check (windows-registry scope)
+        if: inputs.test_scope == 'windows-registry'
+        run: |
+          set -o pipefail
+          pnpm run typecheck 2>&1 | tee ci-logs/check.log
+          pnpm exec vitest run tests/windows-powershell-registry-integration.spec.ts --maxWorkers=1 --no-file-parallelism 2>&1 | tee -a ci-logs/check.log
       # Committed-by-hand build output. `lib/` is what package.json ships
       # (`files: [lib]`) and tests/version.spec.ts asserts a built bundle
       # carries the current version, but nothing in `pnpm run check` compares

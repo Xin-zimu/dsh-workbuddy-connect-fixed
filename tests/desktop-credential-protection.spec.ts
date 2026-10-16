@@ -306,12 +306,15 @@ describe('at-rest key provider', () => {
     if (process.platform === 'darwin') {
       expect(cn.helperPath()).toBe('/Applications/WorkBuddy.app/Contents/MacOS/Electron')
     } else if (process.platform === 'win32') {
+      // #62: on Windows the same provider answers with the LOCALAPPDATA
+      // default when that variable exists — the old `toBeUndefined()` else
+      // branch failed deterministically there. A blank/absent LOCALAPPDATA
+      // (stripped CI environments) stays undefined, mirroring
+      // defaultWorkBuddyElectronPath.
       const localAppData = process.env.LOCALAPPDATA?.trim()
-      if (localAppData === undefined || localAppData === '') {
-        expect(cn.helperPath()).toBeUndefined()
-      } else {
-        expect(cn.helperPath()).toBe(join(localAppData, 'Programs', 'WorkBuddy', 'WorkBuddy.exe'))
-      }
+      expect(cn.helperPath()).toBe(localAppData === undefined || localAppData === ''
+        ? undefined
+        : join(localAppData, 'Programs', 'WorkBuddy', 'WorkBuddy.exe'))
     } else {
       // No verified default layout on this platform: never guess a path.
       expect(cn.helperPath()).toBeUndefined()

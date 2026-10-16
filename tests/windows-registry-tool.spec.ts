@@ -4,9 +4,14 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 const execFileMock = vi.hoisted(() => vi.fn())
 vi.mock('node:child_process', () => ({ execFile: execFileMock }))
 
-import { workBuddyWindowsDiscoveryTools } from '../src/desktop-credential-protection.ts'
+import {
+  WINDOWS_REGISTRY_STEP_TIMEOUT_MS,
+  WORKBUDDY_DISCOVERY_BUDGET_MS,
+  WORKBUDDY_DISCOVERY_STEP_TIMEOUT_MS,
+  workBuddyWindowsDiscoveryTools,
+} from '../src/desktop-credential-protection.ts'
 
-type RegistryFailure = Error & { code: number, killed?: boolean }
+type RegistryFailure = Error & { code: number | string, killed?: boolean }
 
 function registryFailure(stderr: string, killed = false): void {
   execFileMock.mockImplementation((
@@ -33,7 +38,7 @@ function registryFailure(stderr: string, killed = false): void {
 function registryStdout(
   regBytes: Buffer,
   options: {
-    fallback?: { stdout?: string, code?: number, fail?: boolean, killed?: boolean }
+    fallback?: { stdout?: string, code?: number | string, fail?: boolean, killed?: boolean }
     onSpawn?: (binary: string, args: string[], execOptions: object) => void
   } = {},
 ): void {
@@ -94,6 +99,31 @@ describe('Windows registry query failure classification', () => {
     await expect(workBuddyWindowsDiscoveryTools().queryUninstallRoot('HKLM\\Uninstall', new AbortController().signal))
       .rejects.toThrow(/could not complete/)
   })
+
+  it('keeps an oversized document incomplete and names the size limit, not a timeout', async () => {
+    // Node delivers a maxBuffer overflow as code ERR_CHILD_PROCESS_STDIO_MAXBUFFER
+    // with `killed` unset (verified against a real child on this codebase's Node
+    // range): a software-dense machine whose uninstall tree exceeds the 1 MiB
+    // cap must stay "we could not check", never "not installed", and the
+    // message must not point the user at scheduler latency.
+    vi.stubEnv('SystemRoot', 'C:\\Windows')
+    execFileMock.mockImplementation((
+      _binary: string,
+      _args: string[],
+      _options: object,
+      callback: (error: RegistryFailure, stdout: Buffer, stderr: Buffer) => void,
+    ) => {
+      const child = new EventEmitter()
+      const error = Object.assign(new Error('stdout maxBuffer length exceeded'), { code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' })
+      queueMicrotask(() => {
+        callback(error, Buffer.alloc(0), Buffer.alloc(0))
+        child.emit('close')
+      })
+      return child
+    })
+    await expect(workBuddyWindowsDiscoveryTools().queryUninstallRoot('HKLM\\Uninstall', new AbortController().signal))
+      .rejects.toThrow(/reg\.exe could not complete \(the output exceeded the size limit\)/)
+  })
 })
 
 describe('issue #88: fallback triggers on ambiguous bytes only', () => {
@@ -153,6 +183,54 @@ describe('issue #88: fallback triggers on ambiguous bytes only', () => {
     const output = await workBuddyWindowsDiscoveryTools().queryUninstallRoot('HKCU\\Uninstall', new AbortController().signal)
     expect(output).toBe('')
     expect(spawned.some(binary => /powershell/iu.test(binary))).toBe(true)
+  })
+
+  it('re-reads the whole root when the non-ASCII bytes belong to unrelated software (deliberate over-trigger)', async () => {
+    // The recorded follow-up cost of #105/#106/#107: the trigger is a
+    // property of the *root's* bytes, so another product's localized
+    // DisplayName re-reads the root too. Narrowing the trigger to this
+    // product's own entries would mean associating value lines with key
+    // headers before the bytes can be decoded, and the WorkBuddy entry's own
+    // bytes may be the non-ASCII ones — a wrong association silently drops a
+    // real Chinese install path back into the code-page trap #88 fixed. The
+    // whole-root granularity of the Unicode fallback (#88) is deliberate:
+    // narrowing the re-read to individual subkeys would require passing
+    // subkey paths across the process boundary, and a subkey path's own
+    // bytes can be the ambiguous ones — decoding them is the code-page guess
+    // #88 forbids. The -Root bound PowerShell query (#106) therefore
+    // receives only the provably-ASCII root and enumerates everything under
+    // it itself. This test pins that granularity: exactly one whole-root
+    // re-read, whose authoritative output carries the ASCII WorkBuddy entry
+    // unchanged.
+    vi.stubEnv('SystemRoot', 'C:\\Windows')
+    const unrelated = Buffer.concat([
+      Buffer.from('HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{OTHER-0}\r\n    DisplayName    REG_SZ    ', 'ascii'),
+      GBK_CJK,
+      Buffer.from('\r\n', 'ascii'),
+    ])
+    const workbuddyAscii = Buffer.from([
+      'HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{TEST-0}',
+      '    DisplayName    REG_SZ    WorkBuddy',
+      '    DisplayIcon    REG_SZ    "C:\\Program Files\\WorkBuddy\\WorkBuddy.exe",0',
+    ].join('\r\n'), 'ascii')
+    const spawned: string[] = []
+    registryStdout(Buffer.concat([unrelated, workbuddyAscii]), {
+      fallback: {
+        stdout: JSON.stringify([
+          { displayName: '别的软件', displayIcon: 'F:\\人工智能\\Other\\Other.exe' },
+          { displayName: 'WorkBuddy', displayIcon: 'C:\\Program Files\\WorkBuddy\\WorkBuddy.exe' },
+        ]),
+      },
+      onSpawn: binary => { spawned.push(binary) },
+    })
+    const output = await workBuddyWindowsDiscoveryTools().queryUninstallRoot('HKCU\\Uninstall', new AbortController().signal)
+    // One re-read covering the whole root, and the ASCII WorkBuddy entry
+    // survives it intact rather than being mixed from two sources.
+    expect(spawned.filter(binary => /powershell/iu.test(binary))).toHaveLength(1)
+    expect(output).toContain('C:\\Program Files\\WorkBuddy\\WorkBuddy.exe')
+    expect(output).toContain('别的软件')
+    expect(output.includes('{PS-'), 'the document must be the fallback re-encoding, not raw reg.exe text').toBe(true)
+    expect(output.includes('{OTHER-0}'), 'raw reg.exe key headers must not leak through').toBe(false)
   })
 
   it('does not call the fallback when reg.exe already failed', async () => {
@@ -249,6 +327,13 @@ describe('issue #88: fallback failure classification', () => {
       .rejects.toThrow(/timed out/)
   })
 
+  it('keeps an oversized fallback document incomplete and names the size limit', async () => {
+    vi.stubEnv('SystemRoot', 'C:\\Windows')
+    registryStdout(AMBIGUOUS, { fallback: { fail: true, code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' } })
+    await expect(workBuddyWindowsDiscoveryTools().queryUninstallRoot('HKCU\\Uninstall', new AbortController().signal))
+      .rejects.toThrow(/powershell\.exe could not complete \(the output exceeded the size limit\)/)
+  })
+
   it('rejects an unrecognised document rather than guessing at it', async () => {
     vi.stubEnv('SystemRoot', 'C:\\Windows')
     registryStdout(AMBIGUOUS, { fallback: { stdout: 'not json' } })
@@ -285,5 +370,126 @@ describe('issue #88: fallback failure classification', () => {
     expect(call.args).toContain('-NoProfile')
     expect(call.args).toContain('-NonInteractive')
     expect(call.binary).toContain('WindowsPowerShell')
+  })
+})
+
+describe('issues #105/#106/#107: -Command argument binding on Windows PowerShell 5.1', () => {
+  it('hands -Command a call-operator script block so the trailing -Root binds', async () => {
+    vi.stubEnv('SystemRoot', 'C:\\Windows')
+    const calls: { binary: string, args: string[] }[] = []
+    registryStdout(Buffer.concat([GBK_CJK]), { fallback: { stdout: '[]' }, onSpawn: (binary, args) => { calls.push({ binary, args }) } })
+    const root = 'HKCU\\Uninstall'
+    await workBuddyWindowsDiscoveryTools().queryUninstallRoot(root, new AbortController().signal)
+    const call = calls.find(c => /powershell/iu.test(c.binary))!
+    const commandIndex = call.args.indexOf('-Command')
+    // Windows PowerShell 5.1 joins every argument after -Command into ONE
+    // command string and parses that string as code; it does not bind
+    // trailing `-Root <path>` tokens to a script whose text merely starts
+    // with `param`. The pre-fix argv (a bare `param(...)` script with
+    // `-Root <path>` after it) therefore left $Root empty — the trailing
+    // tokens landed inside the script text — and every fallback query ended
+    // as exit 2/3 (#105/#106/#107). These assertions are made against the
+    // joined command the child actually re-parses, so the bare-`param` shape
+    // fails them while the call-operator wrapper passes: `& { … }` makes the
+    // operator apply `-Root <path>` to the script block's param block, the
+    // form #106 verified on a real 5.1 machine.
+    const commandText = call.args.slice(commandIndex + 1).join(' ')
+    const suffix = ` } -Root ${root}`
+    expect(commandText.startsWith('& { ')).toBe(true)
+    expect(commandText.endsWith(suffix)).toBe(true)
+    expect(commandText).toContain('param([string]$Root)')
+    // The root rides only as the -Root value, never inside the script block
+    // the call operator executes.
+    expect(commandText.slice(0, commandText.length - suffix.length)).not.toContain(root)
+  })
+
+  it('keeps exactly one fallback process per root, with no shell in between', async () => {
+    vi.stubEnv('SystemRoot', 'C:\\Windows')
+    const calls: { binary: string, args: string[] }[] = []
+    registryStdout(Buffer.concat([GBK_CJK]), { fallback: { stdout: '[]' }, onSpawn: (binary, args) => { calls.push({ binary, args }) } })
+    await workBuddyWindowsDiscoveryTools().queryUninstallRoot('HKCU\\Uninstall', new AbortController().signal)
+    // The wrapper lives inside the -Command text powershell.exe itself
+    // parses: no cmd.exe, no second interpreter, no extra process.
+    const fallbackCalls = calls.filter(c => /powershell/iu.test(c.binary))
+    expect(fallbackCalls).toHaveLength(1)
+    expect(calls.filter(c => /cmd|pwsh/iu.test(c.binary))).toHaveLength(0)
+  })
+
+  it('passes the three production roots through to the fallback', async () => {
+    // Positive control for the root shape guard: the fixed roots production
+    // queries must all reach the fallback, so the guard can never silently
+    // disable discovery.
+    vi.stubEnv('SystemRoot', 'C:\\Windows')
+    for (const root of [
+      'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall',
+      'HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall',
+      'HKLM\\Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall',
+    ]) {
+      execFileMock.mockReset()
+      const calls: { binary: string, args: string[] }[] = []
+      registryStdout(Buffer.concat([GBK_CJK]), { fallback: { stdout: '[]' }, onSpawn: (binary, args) => { calls.push({ binary, args }) } })
+      await workBuddyWindowsDiscoveryTools().queryUninstallRoot(root, new AbortController().signal)
+      const fallbackCalls = calls.filter(c => /powershell/iu.test(c.binary))
+      expect(fallbackCalls).toHaveLength(1)
+      expect(fallbackCalls[0]!.args[fallbackCalls[0]!.args.indexOf('-Root') + 1]).toBe(root)
+    }
+  })
+})
+
+describe('issues #105/#106/#107: Windows registry step budget', () => {
+  it('gives reg.exe and the PowerShell fallback the Windows step limit, not the macOS one', async () => {
+    // Real CI evidence behind this: on GitHub's windows-2022/2025 images the
+    // plain HKLM uninstall `reg query /s` needs more than the old 3s step
+    // limit, so a software-dense machine read as "absent" when it was merely
+    // slow. Both Windows subprocesses must carry the Windows-specific limit.
+    vi.stubEnv('SystemRoot', 'C:\\Windows')
+    const calls: { binary: string, options: { timeout?: number } }[] = []
+    registryStdout(Buffer.concat([GBK_CJK]), {
+      fallback: { stdout: '[]' },
+      onSpawn: (binary, _args, execOptions) => { calls.push({ binary, options: execOptions as { timeout?: number } }) },
+    })
+    await workBuddyWindowsDiscoveryTools().queryUninstallRoot('HKCU\\Uninstall', new AbortController().signal)
+    const reg = calls.find(call => /reg\.exe$/u.test(call.binary))
+    const fallback = calls.find(call => /powershell/iu.test(call.binary))
+    expect(reg?.options.timeout).toBe(WINDOWS_REGISTRY_STEP_TIMEOUT_MS)
+    expect(fallback?.options.timeout).toBe(WINDOWS_REGISTRY_STEP_TIMEOUT_MS)
+    expect(WINDOWS_REGISTRY_STEP_TIMEOUT_MS).not.toBe(WORKBUDDY_DISCOVERY_STEP_TIMEOUT_MS)
+  })
+
+  it('keeps a Windows step within the whole-discovery budget', () => {
+    // The budget, not the step limit, stays the user-facing ceiling: a step
+    // may never outlive the whole discovery, so raising the Windows step
+    // limit cannot raise the worst-case wait. The budget itself is pinned so
+    // that changing it is a deliberate decision, never a side effect.
+    expect(WINDOWS_REGISTRY_STEP_TIMEOUT_MS).toBeLessThanOrEqual(WORKBUDDY_DISCOVERY_BUDGET_MS)
+    expect(WORKBUDDY_DISCOVERY_BUDGET_MS).toBe(10_000)
+    expect(WORKBUDDY_DISCOVERY_STEP_TIMEOUT_MS).toBe(3_000)
+  })
+})
+
+describe('issues #105/#106/#107: roots are guarded before they reach a command line', () => {
+  // `powershell.exe` re-parses everything after -Command as code, so a root
+  // is only allowed onto that command line when it is provably inert in that
+  // position. Each case below is executable text, a token splitter, or not a
+  // registry path at all; all must be refused before any process starts.
+  it.each([
+    ['statement separator', 'HKCU\\Software; Remove-Item -Recurse C:\\'],
+    ['subexpression', 'HKCU\\Software$(Remove-Item -Recurse C:\\)'],
+    ['backtick escape', 'HKCU\\Software`Remove-Item'],
+    ['double quote', 'HKCU\\Software"'],
+    ['single quote', "HKCU\\Software'"],
+    ['space splitting a component', 'HKCU\\Software\\Program Files\\Uninstall'],
+    ['brace block', 'HKCU\\Software\\{GUID}'],
+    ['ampersand chaining', 'HKLM\\Software & whoami'],
+    ['not a hive', 'HKXX\\Software'],
+    ['hive without a subkey', 'HKLM'],
+  ])('refuses %s without starting the fallback', async (_label, root) => {
+    vi.stubEnv('SystemRoot', 'C:\\Windows')
+    const spawned: string[] = []
+    registryStdout(Buffer.concat([GBK_CJK]), { fallback: { stdout: '[]' }, onSpawn: binary => { spawned.push(binary) } })
+    await expect(workBuddyWindowsDiscoveryTools().queryUninstallRoot(root, new AbortController().signal))
+      .rejects.toThrow(/plain HKLM\/HKCU path this tool may query/)
+    // reg.exe already ran (its output was ambiguous); the fallback must not.
+    expect(spawned.filter(binary => /powershell/iu.test(binary))).toHaveLength(0)
   })
 })

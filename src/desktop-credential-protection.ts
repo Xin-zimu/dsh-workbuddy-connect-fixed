@@ -32,6 +32,7 @@ import { basename, dirname, join } from 'node:path'
 import type { WorkBuddySignedOutReasonCode } from './status-paths.ts'
 import { electronProfileFor } from './variants.ts'
 import type { WorkBuddyElectronProduct, WorkBuddyVariant } from './variants.ts'
+import { isWsl } from './wsl.ts'
 
 /** The four states a desktop auth document can be read as. */
 export type DesktopAuthFormat = 'absent' | 'plaintext' | 'encrypted' | 'unrecognized'
@@ -429,20 +430,26 @@ const WINDOWS_REPLACEMENT_CHARACTER = '\uFFFD'
  * - **Output is JSON.** PowerShell does the escaping, so paths containing
  *   spaces, commas, or quotes no longer depend on column positions, and only
  *   the two values this plugin reads are collected.
+ * - **The invocation wraps this script in a call-operator script block.**
+ *   Windows PowerShell 5.1 joins every argument after `-Command` into one
+ *   command string and parses that string as code, so a script whose text
+ *   merely starts with `param` never receives the trailing `-Root` tokens —
+ *   they land inside the script text, `$Root` stays empty, and every
+ *   fallback query fails as exit 2/3 (#105/#106/#107). See
+ *   {@link WINDOWS_POWERSHELL_QUERY_COMMAND}.
  *
- * The root is passed as a `-Root` argument, never interpolated into the
- * command text.
+ * command text, and it must pass {@link WINDOWS_REGISTRY_ROOT_PATTERN}
+ * before the process starts — `-Command` arguments are re-parsed as code, so
+ * only provably inert path characters may ride along.
  *
- * Invocation shape (issue #88 follow-up): the script is wrapped in
- * `& { … }` and `-Root <value>` follows the wrapper as *separate argv
- * elements*. Everything after `-Command` is treated by powershell.exe as
- * the command string plus arguments *to that string*, so a bare
- * `param([string]$Root)` script never binds `-Root` when the value is a
- * separate argv element — `$Root` stayed empty and every fallback run died
- * with exit 3 ("root unreadable") from `Get-Item 'Registry::'`. The
- * scriptblock wrapper is what makes the trailing arguments bind to the
- * script's `param` block, and it keeps the root out of the command text
- * (a hostile root value can at worst fail to parse, never execute).
+ * The wrapper itself was reached independently by two reports: issue #88's
+ * follow-up measured the bare-`param` argv failure directly (`$Root` stayed
+ * empty and every fallback run died with exit 3, "root unreadable", from
+ * `Get-Item 'Registry::'`), and #105/#106/#107 saw the same exit 2/3 shape on
+ * three separate Windows machines. Both readings agree that everything after
+ * `-Command` is parsed as one command string plus arguments *to that string*,
+ * which is why the scriptblock wrapper is what makes the trailing `-Root`
+ * argv elements bind to the script's `param` block.
  */
 const WINDOWS_REGISTRY_RELATIVE_POWERSHELL = 'System32\\WindowsPowerShell\\v1.0\\powershell.exe'
 /** Exit code meaning the root key does not exist (a normal, expected outcome). */
@@ -471,10 +478,77 @@ export const WINDOWS_POWERSHELL_QUERY_SCRIPT = [
   'ConvertTo-Json -InputObject @($out) -Compress -Depth 3',
 ].join(' ')
 
-/** One discovery subprocess's own limits; see {@link WorkBuddyAtRestKeyProviderOptions}. */
+/**
+ * The `-Command` value actually handed to `powershell.exe`: the query script
+ * wrapped in a call-operator script block.
+ *
+ * Windows PowerShell 5.1 joins every argument that follows `-Command` into
+ * one command string and runs that string as code. A bare `param(...)`
+ * script therefore never binds the trailing `-Root <path>` tokens — they end
+ * up inside the script text, `$Root` is empty, and the query ends as exit
+ * 2/3: discovery incomplete, the app binary is never located, and at-rest
+ * key resolution fails as a silent `signed-out` (#105/#106/#107, three
+ * independent Windows reports on 0.7.2). The call operator makes the binding
+ * explicit: the joined command becomes `& { …script… } -Root <path>`, and
+ * `&` applies the named argument to the script block's `param` block — the
+ * form #106 verified on a real 5.1 machine.
+ *
+ * Exported for the Windows-only integration spec, which replays this exact
+ * text against a real `powershell.exe` 5.1 and derives the pre-fix 0.7.2
+ * argv from it by removing the wrapper. `src/index.ts` does not re-export
+ * it, so it is not part of the package's public API.
+ */
+export const WINDOWS_POWERSHELL_QUERY_COMMAND = `& { ${WINDOWS_POWERSHELL_QUERY_SCRIPT} }`
+
+/**
+ * The only roots this tool will name on a `-Command` command line.
+ *
+ * `powershell.exe` re-parses everything after `-Command` as code, so a root
+ * is handed over only when it is provably inert in that position: a hive
+ * this file actually queries, then subkey components of plain path
+ * characters — no spaces, quotes, subexpressions, or any other byte that
+ * could change what the joined command does. Production roots are the fixed
+ * {@link WINDOWS_REGISTRY_ROOTS}; anything else is refused before any
+ * process starts, as "we could not check", never as executable text.
+ */
+const WINDOWS_REGISTRY_ROOT_PATTERN = /^HK(?:LM|CU)(?:\\[A-Za-z0-9._-]+)+$/u
+
+/**
+ * One discovery subprocess's own limits; see {@link WorkBuddyAtRestKeyProviderOptions}.
+ *
+ * Governs the macOS discovery tools (Spotlight, plutil). The Windows registry
+ * readers have their own, larger limit — {@link WINDOWS_REGISTRY_STEP_TIMEOUT_MS}.
+ */
 export const WORKBUDDY_DISCOVERY_STEP_TIMEOUT_MS = 3_000
 /** Whole-discovery budget, independent of the helper's own timeout. */
 export const WORKBUDDY_DISCOVERY_BUDGET_MS = 10_000
+/**
+ * One Windows registry subprocess's own limit: `reg.exe` or the PowerShell
+ * 5.1 fallback.
+ *
+ * Why larger than the macOS step limit: `reg query <root> /s` over a
+ * software-dense uninstall tree takes seconds, not milliseconds. On GitHub's
+ * windows-2022 and windows-2025 runner images (hundreds of installed
+ * programs) the plain HKLM uninstall read exceeds 3s while HKCU finishes in
+ * ~20ms; on a real user machine the PowerShell fallback itself ran
+ * 135–270ms (#106). A 3s cap therefore cuts the HKLM read in half on
+ * ordinary developer machines and reports the product absent when it is
+ * merely slow to enumerate.
+ *
+ * Why this is safe to raise without touching the budget: the whole-discovery
+ * budget ({@link WORKBUDDY_DISCOVERY_BUDGET_MS}, 10s) still bounds what a
+ * user waits for — during a real discovery the budget abort remains the
+ * effective ceiling, so this limit only decides whether a root that would
+ * have finished inside the budget gets to finish, instead of being cut at 3s
+ * mid-enumeration. For direct `queryUninstallRoot` callers (no outer
+ * budget), this limit is the cap.
+ *
+ * Invariant, asserted by tests: never above the discovery budget. The
+ * remaining known bound — a machine where every root is both slow *and*
+ * non-ASCII, needing more than the budget in total — still ends as a safe
+ * "we could not check" rather than a wrong answer.
+ */
+export const WINDOWS_REGISTRY_STEP_TIMEOUT_MS = 10_000
 const MDFIND_MAX_OUTPUT_BYTES = 1024 * 1024
 const PLUTIL_MAX_OUTPUT_BYTES = 64 * 1024
 
@@ -563,11 +637,112 @@ export interface WorkBuddyAtRestKeyProviderOptions {
   /** Platform override for deterministic discovery tests. */
   platform?: NodeJS.Platform
   /**
+   * Whether the helper spawn crosses WSL→Windows interop. Injectable so tests
+   * can simulate a WSL host on any platform; defaults to the shared
+   * {@link isWsl} check. Only consulted for the key-helper spawn (#133) —
+   * never for discovery.
+   */
+  wsl?: () => boolean
+  /**
    * Total budget for one discovery run, covering the search and every
    * candidate check. Injectable so tests can exercise exhaustion without
    * waiting out the production 10s.
    */
   discoveryBudgetMs?: number
+}
+
+/**
+ * Merge a `WSLENV` value so `ELECTRON_RUN_AS_NODE` crosses WSL→Windows
+ * interop (#133).
+ *
+ * WSL only forwards listed variables to a Windows child, and only when the
+ * entry carries the `/w` (WSL→Windows) direction flag — a plain
+ * `env: { …, ELECTRON_RUN_AS_NODE: '1' }` stays on the Linux side, so the
+ * WorkBuddy exe starts in GUI mode and its stdout is app log rather than the
+ * key payload.
+ *
+ * The target variable is consolidated into exactly ONE safe entry, because
+ * duplicate same-name entries leave the forwarding direction indeterminate:
+ *
+ * - the single entry always carries `w` (the plugin's requirement) and takes
+ *   the position of the first same-name occurrence;
+ * - `u` (Windows→WSL) is kept when ANY existing same-name entry asked for it,
+ *   so a user's bidirectional setup survives as `/uw`;
+ * - the path flags are dropped: `p` (path translation) and `l` (path list)
+ *   would mangle the value, which here is the numeric switch `1` —
+ *   `ELECTRON_RUN_AS_NODE=1` must arrive byte-for-byte, never as a converted
+ *   path. An inherited `/pw`, `/lw`, or `/l` therefore normalizes to a
+ *   path-free flag set rather than being appended to;
+ * - a BARE name carries no direction at all, so it counts as neither `w` nor
+ *   `u` — it only consolidates;
+ * - with no same-name entry at all, `ELECTRON_RUN_AS_NODE/w` is appended;
+ * - every OTHER entry keeps its order and bytes; empty segments (the
+ *   trailing colons Windows Terminal tends to leave) and exact duplicates
+ *   among them are dropped.
+ *
+ * The result is idempotent: merging it again yields the same string.
+ *
+ * @param value - the inherited `WSLENV` value, or `undefined` when unset.
+ * @returns the `WSLENV` value the child should receive.
+ */
+export function wslenvForwardRunAsNode(value: string | undefined): string {
+  const merged: string[] = []
+  /** Index of the consolidated target entry inside `merged`, once placed. */
+  let targetIndex = -1
+  /** The safe flag set for the target: always `w`, plus `u` if asked for. */
+  let targetFlags = '/w'
+  for (const entry of (value ?? '').split(':')) {
+    if (entry === '') continue
+    const slash = entry.indexOf('/')
+    const name = slash === -1 ? entry : entry.slice(0, slash)
+    if (name !== 'ELECTRON_RUN_AS_NODE') {
+      // Other variables are none of the plugin's business: keep them as-is,
+      // collapsing only exact duplicates.
+      if (!merged.includes(entry)) merged.push(entry)
+      continue
+    }
+    const flags = slash === -1 ? '' : entry.slice(slash + 1)
+    // A later duplicate may be the one carrying the `u` direction; remember
+    // it and re-write the single consolidated entry in place.
+    if (flags.includes('u')) targetFlags = '/uw'
+    if (targetIndex === -1) {
+      targetIndex = merged.length
+      merged.push(`ELECTRON_RUN_AS_NODE${targetFlags}`)
+    } else {
+      merged[targetIndex] = `ELECTRON_RUN_AS_NODE${targetFlags}`
+    }
+  }
+  if (targetIndex === -1) merged.push(`ELECTRON_RUN_AS_NODE${targetFlags}`)
+  return merged.join(':')
+}
+
+/**
+ * The environment the at-rest key helper is spawned with (#133).
+ *
+ * Always a fresh object — the parent (`process.env` in production) is never
+ * mutated. `ELECTRON_RUN_AS_NODE=1` forces the Electron binary into plain
+ * Node mode; when the spawn crosses WSL→Windows interop — a WSL host and a
+ * helper that is itself a Windows executable — the child's `WSLENV` is
+ * additionally merged via {@link wslenvForwardRunAsNode} so the interop layer
+ * actually forwards that variable. Every other platform and path combination
+ * gets the previous behaviour byte-for-byte.
+ *
+ * @param parent - the environment to inherit (a copy is taken).
+ * @param electronPath - the helper binary about to be spawned.
+ * @param wsl - whether the current process runs inside WSL.
+ * @returns the child process environment.
+ */
+export function helperChildEnv(parent: NodeJS.ProcessEnv, electronPath: string, wsl: boolean): NodeJS.ProcessEnv {
+  const childEnv: NodeJS.ProcessEnv = { ...parent, ELECTRON_RUN_AS_NODE: '1' }
+  // The interop decision follows the FILE, not the mount point: WSL's
+  // automount root is configurable (`/windir/`, `/`, …), so a Windows exe can
+  // legitimately live outside `/mnt`. A Windows executable is recognized by
+  // its `.exe` suffix (case-insensitive); a native Linux helper — even one
+  // installed under `/mnt` — never consults WSLENV and stays untouched.
+  if (wsl && basename(electronPath).toLowerCase().endsWith('.exe')) {
+    childEnv['WSLENV'] = wslenvForwardRunAsNode(childEnv['WSLENV'])
+  }
+  return childEnv
 }
 
 /**
@@ -683,7 +858,7 @@ export function workBuddyWindowsDiscoveryTools(): WorkBuddyWindowsDiscoveryTools
     let settled = false
     const child = execFile(regPath, ['query', root, '/s'], {
       maxBuffer: WINDOWS_REGISTRY_OUTPUT_MAX_BYTES,
-      timeout: WORKBUDDY_DISCOVERY_STEP_TIMEOUT_MS,
+      timeout: WINDOWS_REGISTRY_STEP_TIMEOUT_MS,
       windowsHide: true,
       // Raw bytes, not a decode: whether this output is ambiguous is decided
       // from the bytes themselves (#88), so Node must not pick an encoding.
@@ -704,7 +879,7 @@ export function workBuddyWindowsDiscoveryTools(): WorkBuddyWindowsDiscoveryTools
           resolve(Buffer.alloc(0))
           return
         }
-        reject(new DiscoveryIncompleteError(`reg.exe could not complete (${error.killed === true ? 'timed out' : String(error.code ?? 'unavailable')})`))
+        reject(new DiscoveryIncompleteError(`reg.exe could not complete (${subprocessFailureReason(error)})`))
         return
       }
       resolve(stdout)
@@ -729,6 +904,13 @@ export function workBuddyWindowsDiscoveryTools(): WorkBuddyWindowsDiscoveryTools
    * three roots being absent is normal and must not fail the search.
    */
   const runFallback = (root: string, signal: AbortSignal): Promise<string> => new Promise<string>((resolve, reject) => {
+    // Guarded before anything starts: this root is about to ride a command
+    // line that is re-parsed as code, so it must be a plain path (see
+    // WINDOWS_REGISTRY_ROOT_PATTERN).
+    if (!WINDOWS_REGISTRY_ROOT_PATTERN.test(root)) {
+      reject(new DiscoveryIncompleteError('the registry root was not a plain HKLM/HKCU path this tool may query'))
+      return
+    }
     if (powershellPath === undefined) {
       reject(new DiscoveryIncompleteError('SystemRoot is not configured'))
       return
@@ -745,12 +927,12 @@ export function workBuddyWindowsDiscoveryTools(): WorkBuddyWindowsDiscoveryTools
       '-NoProfile',
       '-NonInteractive',
       '-Command',
-      `& { ${WINDOWS_POWERSHELL_QUERY_SCRIPT} }`,
+      WINDOWS_POWERSHELL_QUERY_COMMAND,
       '-Root',
       root,
     ], {
       maxBuffer: WINDOWS_REGISTRY_OUTPUT_MAX_BYTES,
-      timeout: WORKBUDDY_DISCOVERY_STEP_TIMEOUT_MS,
+      timeout: WINDOWS_REGISTRY_STEP_TIMEOUT_MS,
       windowsHide: true,
       encoding: 'utf8',
     }, (error, stdout) => {
@@ -769,7 +951,7 @@ export function workBuddyWindowsDiscoveryTools(): WorkBuddyWindowsDiscoveryTools
           reject(new DiscoveryIncompleteError(`powershell.exe could not read the registry root ${root}`))
           return
         }
-        reject(new DiscoveryIncompleteError(`powershell.exe could not complete (${error.killed === true ? 'timed out' : String(error.code ?? 'unavailable')})`))
+        reject(new DiscoveryIncompleteError(`powershell.exe could not complete (${subprocessFailureReason(error)})`))
         return
       }
       const records = parseWindowsUninstallJson(stdout)
@@ -802,6 +984,17 @@ export function workBuddyWindowsDiscoveryTools(): WorkBuddyWindowsDiscoveryTools
       // byte pairs decode as valid UTF-8 with no replacement character at all,
       // so the reported case could pass silently. Byte range has no such blind
       // spot.
+      //
+      // Known cost, deliberately kept (recorded as an independent follow-up to
+      // #105/#106/#107, not changed in the hotfix): any non-ASCII byte
+      // anywhere in the root's output — another product's localized
+      // DisplayName included — re-reads the whole root through PowerShell.
+      // Narrowing the trigger to this product's own entries would mean
+      // associating value lines with their key headers before the bytes can
+      // be decoded, and a wrong association silently drops a real Chinese
+      // WorkBuddy path back into the code-page trap #88 fixed. Until that
+      // association can be made safely, the over-trigger costs one extra
+      // process per affected root, not correctness.
       if (isAsciiOnly(raw)) return raw.toString('utf8')
       return await runFallback(root, signal)
     },
@@ -876,6 +1069,7 @@ function parseWindowsUninstallJson(output: string): string | undefined {
   private readonly platform: NodeJS.Platform
   private readonly discoveryBudgetMs: number
   private readonly timeoutMs: number
+  private readonly wsl: () => boolean
   private readonly source: WorkBuddyKeyPayloadSource
   private readonly spawnHelper: (electronPath: string) => Promise<string>
   /**
@@ -906,6 +1100,7 @@ function parseWindowsUninstallJson(output: string): string | undefined {
     this.windowsTools = options.windowsTools ?? workBuddyWindowsDiscoveryTools()
     this.discoveryBudgetMs = options.discoveryBudgetMs ?? WORKBUDDY_DISCOVERY_BUDGET_MS
     this.timeoutMs = options.timeoutMs ?? 10_000
+    this.wsl = options.wsl ?? isWsl
     this.spawnHelper = options.spawnHelper ?? (path => this.spawnAt(path))
     this.source = options.source ?? (() => this.spawnPayload())
   }
@@ -1215,7 +1410,11 @@ function parseWindowsUninstallJson(output: string): string | undefined {
         timeout: this.timeoutMs,
         maxBuffer: 1024 * 1024,
         windowsHide: true,
-        env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
+        // #133: under WSL→Windows interop the variable must ALSO be listed in
+        // the child's WSLENV with the /w flag, or the Windows exe never sees
+        // it and starts in GUI mode. helperChildEnv keeps every other
+        // platform's environment byte-for-byte as before.
+        env: helperChildEnv(process.env, electronPath, this.wsl()),
       }, (error, stdout) => {
         if (error !== null && error !== undefined) {
           // Code and reason only: stdout/stderr can carry paths or crash dumps,
@@ -1243,6 +1442,20 @@ function parseWindowsUninstallJson(output: string): string | undefined {
       })
     })
   }
+}
+
+/**
+ * Why a finished-but-failed discovery subprocess cannot produce an answer.
+ *
+ * A size-limit overflow (`maxBuffer`, delivered as
+ * `ERR_CHILD_PROCESS_STDIO_MAXBUFFER`) gets its own words: reporting it as a
+ * timeout would send a user chasing scheduler latency when the machine's
+ * uninstall tree is simply larger than the documented cap — a different
+ * problem with a different fix. Both stay "incomplete", never "absent".
+ */
+function subprocessFailureReason(error: { readonly code?: unknown, readonly killed?: boolean }): string {
+  if (error.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') return 'the output exceeded the size limit'
+  return error.killed === true ? 'timed out' : String(error.code ?? 'unavailable')
 }
 
 /** Only known missing-key diagnostics can safely make a failed query empty. */

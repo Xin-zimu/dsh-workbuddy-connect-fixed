@@ -119,7 +119,11 @@ describe('A. disabled-list semantics (visibility store)', () => {
     expect(new WorkBuddyVisibilityStore(path).disabled('uid-a:')).toEqual(['hy3'])
   })
 
-  it('writes the file with owner-only permissions', () => {
+  // Windows-gated (#62): owner/group/other permission bits do not exist on
+  // Windows, where statSync reports the same mode for every writable file, so
+  // the 0o600-vs-world assertion is untestable there. The write path itself
+  // stays covered on every platform by the surrounding tests.
+  it.skipIf(process.platform === 'win32')('writes the file with owner-only permissions', () => {
     const path = join(tempDir('wb-vis-'), 'v.json')
     new WorkBuddyVisibilityStore(path).setVisible('uid-a:', 'hy3', false)
     if (process.platform === 'win32') {
