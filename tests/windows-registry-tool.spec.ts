@@ -13,7 +13,7 @@ import {
 
 type RegistryFailure = Error & { code: number | string, killed?: boolean }
 
-function registryFailure(stderr: string, killed = false): void {
+function registryFailure(stderr: string | Buffer, killed = false): void {
   execFileMock.mockImplementation((
     _binary: string,
     _args: string[],
@@ -23,7 +23,11 @@ function registryFailure(stderr: string, killed = false): void {
     const child = new EventEmitter()
     const error = Object.assign(new Error('reg query failed'), { code: 1, killed })
     queueMicrotask(() => {
-      callback(error, Buffer.alloc(0), Buffer.from(stderr, 'utf8'))
+      // Bytes pass through untouched; a string is UTF-8 encoded, which is what
+      // a caller writing a literal expects. The production path hands over raw
+      // bytes (`encoding: 'buffer'`), so a test that cares about the code page
+      // must pass the Buffer itself.
+      callback(error, Buffer.alloc(0), typeof stderr === 'string' ? Buffer.from(stderr, 'utf8') : stderr)
       child.emit('close')
     })
     return child
@@ -87,6 +91,58 @@ describe('Windows registry query failure classification', () => {
     await expect(workBuddyWindowsDiscoveryTools().queryUninstallRoot('HKCU\\Missing', new AbortController().signal))
       .resolves.toBe('')
     expect(execFileMock).toHaveBeenCalledTimes(1)
+  })
+
+  /**
+   * The bytes a real zh-CN host actually emits, measured through the
+   * production spawn shape.
+   *
+   * These are the raw stderr bytes of
+   * `reg query <missing> /s` started with `windowsHide: true` on a zh-CN
+   * Windows 11 26100 host: the message is written in the GBK/OEM code page
+   * (「错误: 系统找不到指定的注册表项或值。」 plus CRLF), *not* UTF-8. The
+   * regression this pins: the decoder used to be fixed at UTF-8, so these
+   * bytes became replacement characters, the Chinese pattern could never
+   * match, and a **missing** root was reported as
+   * `DiscoveryIncompleteError` — "we could not check" — on every zh-CN
+   * machine. `discoverWindowsApp` turns that into `unresolved`, and the whole
+   * Windows app discovery degrades to `electron-binary-unavailable`.
+   *
+   * The bytes are spelled out rather than produced by `Buffer.from(text,
+   * 'gbk')`, because Node has no GBK *encoder* — only the decoder — so this
+   * literal is the only way to state the real input. They are exactly the
+   * bytes captured from the child.
+   */
+  const GBK_KEY_MISSING = Buffer.from(
+    'b4edcef33a20cfb5cdb3d5d2b2bbb5bdd6b8b6a8b5c4d7a2b2e1b1edcfeebbf2d6b5a1a30d0a',
+    'hex',
+  )
+
+  it('treats the GBK missing-key diagnostic as an empty result (zh-CN host, windowsHide)', async () => {
+    vi.stubEnv('SystemRoot', 'C:\\Windows')
+    registryFailure(GBK_KEY_MISSING)
+    await expect(workBuddyWindowsDiscoveryTools().queryUninstallRoot('HKCU\\Missing', new AbortController().signal))
+      .resolves.toBe('')
+    expect(execFileMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('confirms the fixture really is GBK and really is not UTF-8', () => {
+    // Guards the guard: if this fixture ever became valid UTF-8 (or stopped
+    // decoding as GBK), the test above would still pass for the wrong reason
+    // and prove nothing about the code page.
+    expect(GBK_KEY_MISSING.every(byte => byte < 0x80), 'the fixture must carry non-ASCII bytes').toBe(false)
+    expect(new TextDecoder('gbk').decode(GBK_KEY_MISSING).trim()).toBe('错误: 系统找不到指定的注册表项或值。')
+    expect(() => new TextDecoder('utf-8', { fatal: true }).decode(GBK_KEY_MISSING)).toThrow()
+  })
+
+  it('does not accept the GBK diagnostic when it is not the whole message', async () => {
+    // The patterns are anchored, so a localized diagnostic embedded in other
+    // output is not a confirmed missing key. Appending a line models a child
+    // that failed for a reason beyond the missing root.
+    vi.stubEnv('SystemRoot', 'C:\\Windows')
+    registryFailure(Buffer.concat([GBK_KEY_MISSING, Buffer.from('ERROR: Access is denied.\r\n', 'utf8')]))
+    await expect(workBuddyWindowsDiscoveryTools().queryUninstallRoot('HKLM\\Uninstall', new AbortController().signal))
+      .rejects.toThrow(/could not complete/)
   })
 
   it.each([

@@ -870,12 +870,16 @@ export function workBuddyWindowsDiscoveryTools(): WorkBuddyWindowsDiscoveryTools
       // confirmed missing-key diagnostic is an empty result; every other
       // failure stays incomplete rather than becoming "not installed".
       //
-      // Both supported diagnostics are ASCII in every code page, so reading
-      // stderr as UTF-8 cannot change whether this regex matches; a diagnostic
-      // that is not one of them stays incomplete, as before.
+      // The bytes go to {@link windowsRegistryKeyMissing} undecoded: the
+      // diagnostic is localized and written in the console's code page, so
+      // which encoding reads it is a property of the *message*, not of this
+      // call site. (This line previously decoded as UTF-8 on the stated
+      // premise that both diagnostics are ASCII in every code page. That
+      // premise is false for the Chinese one, and the consequence was a
+      // missing root reported as "could not complete" on every zh-CN host.)
       if (error !== null && error !== undefined) {
         if (error.killed !== true && (error.code === 1 || error.code === '1')
-          && windowsRegistryKeyMissing(stderr.toString('utf8'))) {
+          && windowsRegistryKeyMissing(stderr)) {
           resolve(Buffer.alloc(0))
           return
         }
@@ -1458,11 +1462,97 @@ function subprocessFailureReason(error: { readonly code?: unknown, readonly kill
   return error.killed === true ? 'timed out' : String(error.code ?? 'unavailable')
 }
 
-/** Only known missing-key diagnostics can safely make a failed query empty. */
-function windowsRegistryKeyMissing(stderr: string): boolean {
-  const detail = stderr.trim()
-  return /^ERROR:\s*The system was unable to find the specified registry key or value\.?$/iu.test(detail)
-    || /^错误[:：]\s*系统找不到指定的注册表项或值[。.]?$/u.test(detail)
+/**
+ * The English missing-key diagnostic, the one `reg.exe` emits on an en-US host.
+ *
+ * Measured on Windows 11 26100: a bare `reg query <missing> /s` prints exactly
+ * this line. It is pure ASCII, so no decoding question arises for it.
+ */
+const REG_EXE_KEY_MISSING_ASCII = /^ERROR:\s*The system was unable to find the specified registry key or value\.?$/iu
+
+/**
+ * The Chinese missing-key diagnostics, in the console code page `reg.exe`
+ * actually wrote them in.
+ *
+ * Unlike the English line these are **not** ASCII, and which encoding produced
+ * the bytes depends on how the child was started — not on the user's locale
+ * alone:
+ *
+ * - `windowsHide: true` (what this module uses, and what keeps a console
+ *   window from flashing) starts the child with no console, and `reg.exe`
+ *   then writes its message in the **GBK/OEM code page** — measured on a
+ *   zh-CN host as the 38 bytes
+ *   `b4ed cef3 3a20 …` = 「错误: 系统找不到指定的注册表项或值。」.
+ * - A console-attached invocation of the same command on the same host prints
+ *   the **English** line above, because the message table falls back to
+ *   en-US whenever no console language can be resolved.
+ *
+ * So the previous shape — decode as UTF-8, then match a Chinese regex — could
+ * never match: UTF-8 decoding of GBK bytes yields replacement characters, not
+ * 「错误」. The matched text is therefore tried in each encoding that a real
+ * host produces, and each pattern below is anchored, so a wrong decoding
+ * cannot accidentally satisfy one.
+ */
+const REG_EXE_KEY_MISSING_GBK = /^错误[:：]\s*系统找不到指定的注册表项或值[。.]?$/u
+
+/**
+ * Decode `bytes` with `encoding`, or `undefined` when they are not valid text
+ * in it.
+ *
+ * `fatal: true` is the point: a lossy decode would hand back a string full of
+ * U+FFFD that no anchored pattern can match anyway, so asking for validity
+ * turns "wrong code page" into a clean `undefined` instead of a silent
+ * near-miss.
+ *
+ * Both ways this can fail are caught, and for the same reason — the caller
+ * treats `undefined` as "this encoding did not produce the diagnostic" and
+ * moves on to the next one:
+ *
+ * - the bytes are not valid in `encoding` (`TypeError`, thrown at decode);
+ * - `encoding` is not in the runtime's table at all (`RangeError`, thrown at
+ *   construction). Node ships the legacy multi-byte code pages — `gbk`
+ *   included — only in full-ICU builds; a small-ICU build has no `gbk`. The
+ *   degradation is then the old behaviour for the Chinese diagnostic (the
+ *   English one still matches), never a crash on a path that must not throw.
+ */
+function decodeStrict(bytes: Buffer, encoding: string): string | undefined {
+  try {
+    return new TextDecoder(encoding, { fatal: true }).decode(bytes)
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Whether a failed `reg query` failed *because the root does not exist*, which
+ * is a normal outcome, rather than for any other reason, which is not.
+ *
+ * Only a confirmed missing-key diagnostic may turn a failure into an empty
+ * result: every other exit-1 failure — access denied above all — stays
+ * {@link DiscoveryIncompleteError}, because reporting an unreadable root as
+ * "absent" is exactly the conflation this predicate exists to prevent.
+ *
+ * Takes the child's **raw stderr bytes**, not a pre-decoded string. The
+ * diagnostic is localized, and its encoding is decided by how the child was
+ * started (see {@link REG_EXE_KEY_MISSING_GBK}), so no single caller-side
+ * decode is correct for every host. Each candidate decoding is tried and the
+ * result must match a pattern **anchored to the whole message**: a code page
+ * that happens to decode the bytes without error still cannot pass, because
+ * the text it produces is not the diagnostic.
+ *
+ * @param stderr - the child's stderr exactly as it arrived.
+ */
+function windowsRegistryKeyMissing(stderr: Buffer): boolean {
+  // UTF-8 first: it is the encoding of the English message, and the one every
+  // other string in this process arrives in, so the common case costs one
+  // decode attempt.
+  for (const encoding of ['utf-8', 'gbk']) {
+    const text = decodeStrict(stderr, encoding)
+    if (text === undefined) continue
+    const detail = text.trim()
+    if (REG_EXE_KEY_MISSING_ASCII.test(detail) || REG_EXE_KEY_MISSING_GBK.test(detail)) return true
+  }
+  return false
 }
 
 /**
