@@ -675,18 +675,25 @@ describe('WSL default desktop path probing', () => {
     env?: Partial<Record<'APPDATA' | 'LOCALAPPDATA' | 'USERPROFILE', string>>
   }, run: () => Promise<T>): Promise<T> {
     const savedPlatform = process.platform
-    const savedEnv = Object.fromEntries(
-      ['APPDATA', 'LOCALAPPDATA', 'USERPROFILE', 'WSL_DISTRO_NAME', 'WSL_INTEROP']
-        .map(name => [name, process.env[name]]),
-    )
+    // XDG_CONFIG_HOME/XDG_DATA_HOME are neutralized here for the same reason
+    // asLinux neutralizes them: the linux branch adopts a non-empty absolute
+    // XDG override in preference to the stubbed home (see `xdgBase` in
+    // `src/auth.ts`), so a host that exports one — the ubuntu runner sets
+    // XDG_CONFIG_HOME=/home/runner/.config — makes the Linux-path half of the
+    // candidate list come from the runner instead of from `home`. The Windows
+    // half is unaffected, which is why only the assertion that names the Linux
+    // candidates caught it. Deleting them is not a workaround: `home` is the
+    // input this helper is documented to pin, so the platform defaults must be
+    // derived from it.
+    const managed = [
+      'APPDATA', 'LOCALAPPDATA', 'USERPROFILE', 'WSL_DISTRO_NAME', 'WSL_INTEROP',
+      'XDG_CONFIG_HOME', 'XDG_DATA_HOME',
+    ]
+    const savedEnv = Object.fromEntries(managed.map(name => [name, process.env[name]]))
     Object.defineProperty(process, 'platform', { value: 'linux', configurable: true })
     fakeOs.home = options.home
     fakeOs.release = '6.6.87.2-microsoft-standard-WSL2'
-    delete process.env['APPDATA']
-    delete process.env['LOCALAPPDATA']
-    delete process.env['USERPROFILE']
-    delete process.env['WSL_DISTRO_NAME']
-    delete process.env['WSL_INTEROP']
+    for (const name of managed) delete process.env[name]
     Object.assign(process.env, options.env)
     try {
       return await run()
