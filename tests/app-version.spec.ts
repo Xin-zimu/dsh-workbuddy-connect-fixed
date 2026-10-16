@@ -1,6 +1,6 @@
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   appVersionPath,
@@ -135,9 +135,18 @@ describe('resolveAppVersion', () => {
 
   it('still answers when the cache cannot be written', async () => {
     // A read-only home must not take the catalog down with it.
+    //
+    // The path is a *file inside an existing file*: mkdir/write under it fails
+    // with ENOTDIR everywhere. It deliberately is NOT a `/proc/...` path —
+    // `mkdirSync(recursive: true)` on Linux **blocks the event loop forever**
+    // under /proc (measured: reproduced in WSL, and it hung this repo's ubuntu
+    // CI job for the full 20-minute budget), so a synchronous recursive mkdir
+    // there cannot even be rescued by a test timeout.
+    const blocked = join(dirname(await tempPath()), 'not-a-directory')
+    await writeFile(blocked, 'this is a file, not a directory')
     await expect(resolveAppVersion({
       installed: async () => ({ version: '5.5.2', bundle: '/x' }),
-      path: '/proc/definitely-not-writable/version.json',
+      path: join(blocked, 'version.json'),
     })).resolves.toMatchObject({ version: '5.5.2', source: 'installed' })
   })
 

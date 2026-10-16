@@ -107,7 +107,18 @@ describe('WorkBuddyCatalogStore', () => {
   })
 
   it('survives an unwritable path without throwing', () => {
-    const store = new WorkBuddyCatalogStore({ path: '/proc/definitely-not-writable/catalog.json' })
+    // A path *through an existing regular file* — the write fails with ENOTDIR
+    // on every platform, which is the condition under test.
+    //
+    // Not `/proc/...`, which this case used to use: `mkdirSync(recursive: true)`
+    // under /proc **blocks the event loop forever** on Linux (reproduced in WSL).
+    // It is a synchronous block, so no test timeout can rescue it, and it hung
+    // this repo's ubuntu CI job until the 20-minute job limit killed it.
+    const dir = mkdtempSync(join(tmpdir(), 'wb-catalog-blocked-'))
+    CLEANUP.push(dir)
+    const blocked = join(dir, 'not-a-directory')
+    writeFileSync(blocked, 'this is a file, not a directory')
+    const store = new WorkBuddyCatalogStore({ path: join(blocked, 'catalog.json') })
     // Saving is best-effort: the plugin has already served these models, and a
     // failed write must not surface as a crash.
     expect(() => store.set('uid-1:ent-1', { source: 's', fetchedAtMs: 1, models: [model('a')] })).not.toThrow()

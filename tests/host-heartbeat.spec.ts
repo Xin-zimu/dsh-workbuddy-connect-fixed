@@ -126,6 +126,9 @@ describe('host heartbeat', () => {
     // to lean on is covered by the `processStartTimeMs` cases below, which
     // drive the same win32 branch with the same hoisted mock.
     vi.spyOn(process, 'platform', 'get').mockReturnValue('win32')
+    // See `withWindowsWmic`: the win32 branch resolves its tool from SystemRoot
+    // and never guesses one, so the value must be set rather than inherited.
+    vi.stubEnv('SystemRoot', 'C:\\Windows')
     processQuery.output = `CreationDate\n20260923104314.239907+480\n\n`
     const startAtMs = processStartTimeMs(process.pid)
     expect(startAtMs).toBeDefined()
@@ -236,6 +239,13 @@ describe('processStartTimeMs wmic token extraction (production path)', () => {
    */
   function withWindowsWmic(output: string, run: () => void): void {
     vi.spyOn(process, 'platform', 'get').mockReturnValue('win32')
+    // SystemRoot must be set explicitly. `windowsSystemTool` resolves both
+    // stages from it and returns `undefined` when it is unset — by design, so a
+    // Windows tool is never guessed. Relying on the ambient value made these
+    // cases pass on a Windows dev box (where SystemRoot is always present) and
+    // fail on Linux/macOS CI, where it is not: the canned answer below was
+    // never consumed and `processStartTimeMs` returned undefined.
+    vi.stubEnv('SystemRoot', 'C:\\Windows')
     processQuery.output = output
     run()
   }
@@ -283,10 +293,22 @@ describe('processStartTimeMs Windows branch: absolute paths and bounded subproce
     expect(processStartTimeMs(4321)).toBeUndefined()
 
     const spawned = processQuery.calls.map(call => call.binary)
-    expect(spawned).toEqual([
-      join('C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'),
-      join('C:\\Windows', 'System32', 'wbem', 'wmic.exe'),
+    //
+    // Compared by PATH COMPONENTS, not by spelling. `join()` emits the running
+    // host's separator, so on Linux/macOS this yields
+    // `C:\\Windows/System32/...`. That is not a defect to paper over: the win32
+    // branch only ever executes on a real Windows host, where `join` emits `\\`
+    // and the path is exactly right; the mixed form is an artifact of stubbing
+    // `process.platform` on a POSIX test host. Normalizing both sides keeps the
+    // assertion about the CONTRACT — SystemRoot plus the tool's path, never a
+    // bare name — and lets it hold on every CI platform.
+    const components = (value: string): string[] => value.split(/[\\/]+/u)
+    expect(spawned.map(components)).toEqual([
+      components('C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe'),
+      components('C:\\Windows\\System32\\wbem\\wmic.exe'),
     ])
+    // The tool really is under SystemRoot, and not resolved from anywhere else.
+    for (const binary of spawned) expect(binary.startsWith('C:\\Windows')).toBe(true)
     // The literal regression: nothing is spawned by bare name.
     for (const binary of spawned) {
       expect(binary).not.toBe('wmic')

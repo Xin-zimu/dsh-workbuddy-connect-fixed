@@ -60,6 +60,60 @@ function ownerCanOpen(path: string): boolean {
   }
 }
 
+/**
+ * Principals that must never appear in a hardened file's DACL.
+ *
+ * Named as the plain text `icacls` prints — `Everyone`, not `\\Everyone`. This
+ * value is asserted against real principals below, before it is used, because
+ * an over-escaped alternative is invisible: `/\\\\Everyone/` compiles to the
+ * literal `\\Everyone`, which no `icacls` output ever contains, so that branch
+ * silently matches nothing and the assertion keeps passing while a world-
+ * readable ACE sits in the DACL. That is exactly the shape this constant was
+ * in before it was checked.
+ *
+ * `BUILTIN\Users` and `Authenticated Users` are the unprivileged groups;
+ * `Everyone` is the world. `NT AUTHORITY\SYSTEM` and `BUILTIN\Administrators`
+ * are deliberately NOT listed: Windows keeps them as explicit entries after
+ * `/inheritance:r /grant:r`, and neither is reachable by another unprivileged
+ * user, so their presence is not the leak this hardening closes.
+ */
+const LEAKED_PRINCIPALS = /BUILTIN\\Users|Everyone|Authenticated Users/iu
+
+/**
+ * Real `icacls` DACL lines, one per alternative in {@link LEAKED_PRINCIPALS}.
+ *
+ * Each must be matched, and the benign entries below must not be. Without this
+ * the security assertion is unfalsifiable: a pattern that matches none of the
+ * principals it names would still make every hardening test pass.
+ */
+const LEAK_SAMPLES = [
+  'C:\\state.json Everyone:(R)',
+  'C:\\state.json BUILTIN\\Everyone:(R)',
+  'C:\\state.json BUILTIN\\Users:(RX)',
+  'C:\\state.json Authenticated Users:(M)',
+] as const
+
+/** Owner-only and administrative entries a hardened DACL legitimately carries. */
+const BENIGN_SAMPLES = [
+  'C:\\state.json xin\\xin:(F)',
+  'C:\\state.json NT AUTHORITY\\SYSTEM:(F)',
+  'C:\\state.json BUILTIN\\Administrators:(F)',
+] as const
+
+describe('the leak assertion itself', () => {
+  it('matches every leaked principal and none of the benign ones', () => {
+    // Guards the guard: this is what makes the hardening test below meaningful.
+    // An over- or under-escaped alternative fails here rather than silently
+    // weakening the security assertion on a platform most runs never touch.
+    for (const sample of LEAK_SAMPLES) {
+      expect(LEAKED_PRINCIPALS.test(sample), `${sample} must be treated as a leak`).toBe(true)
+    }
+    for (const sample of BENIGN_SAMPLES) {
+      expect(LEAKED_PRINCIPALS.test(sample), `${sample} must not be treated as a leak`).toBe(false)
+    }
+  })
+})
+
 const WINDOWS_ONLY = process.platform === 'win32'
 
 describe('hardenFilePermissions', () => {
@@ -81,10 +135,22 @@ describe('hardenFilePermissions', () => {
 
     const after = dacl(path)
     expect(after).toBeDefined()
-    // Every inherited group ACE is gone; the current user is the only grantee.
-    expect(after).not.toMatch(/BUILTIN\\Users|Everyone|NT AUTHORITY/i)
+    // The claim this module makes is narrower than "one ACE and nothing else":
+    // it strips *inherited* ACEs and grants the owner full control. Windows
+    // keeps SYSTEM and BUILTIN\\Administrators as explicit entries, and on a
+    // CI runner both were still present after hardening — neither is reachable
+    // by another unprivileged user. Asserting their absence passed on a dev box
+    // (whose parent directory granted them only by inheritance) and failed on CI.
+    //
+    // What must hold: nothing is left INHERITED, and no world/Users-group entry
+    // survives — the actual leak this hardening exists to close.
+    // `LEAKED_PRINCIPALS` is itself asserted against real principal spellings
+    // above, so this pair cannot pass by matching nothing.
+    expect(after).not.toMatch(/\(I\)/)
+    expect(after).not.toMatch(LEAKED_PRINCIPALS)
     const user = process.env.USERNAME?.trim()
     if (user !== undefined && user !== '') expect(after).toContain(user)
+    // The owner's grant is full control.
     expect(after).toMatch(/\(F\)/)
   })
 
