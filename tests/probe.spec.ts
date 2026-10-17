@@ -19,6 +19,15 @@ const ACCEPTED: ProbeAttempt = { status: 200, streamed: true }
 const REJECTED: ProbeAttempt = { status: 400, streamed: false, errorCode: 'invalid_reasoning_effort' }
 /** The global endpoint's rejection, measured 2026-10-01: same 11133 envelope, generic code. */
 const GLOBAL_REJECTED: ProbeAttempt = { status: 400, streamed: false, errorCode: 'model_param_invalid' }
+/**
+ * The global endpoint's respelled rejection, measured 2026-10-16 (issue #143):
+ * byte-identical `11133` envelope, only `extError.code` renamed.
+ */
+const GLOBAL_REJECTED_RESPELT: ProbeAttempt = {
+  status: 400,
+  streamed: false,
+  errorCode: 'invalid_parameter_value',
+}
 
 /** A sender that answers from a table keyed by effort, with `undefined` = baseline. */
 function tableSender(table: Map<string | undefined, ProbeAttempt>): ProbeSender {
@@ -122,6 +131,44 @@ describe('probeModel', () => {
       ['max', ACCEPTED],
     ])
     const outcome = await probeModel({ send: tableSender(table), sentinel: () => SENTINEL, region: 'global' })
+    expect(outcome.validation).toBe('validating')
+    expect(outcome.efforts).toEqual(['low', 'medium', 'high', 'xhigh', 'max'])
+  })
+
+  it('reads the global endpoint\'s respelled parameter rejection as an effort rejection', async () => {
+    // Measured 2026-10-16 on www.workbuddy.ai (issue #143): the same
+    // 400/11133 envelope as the 2026-10-01 measurement, with `extError.code`
+    // respelled to `invalid_parameter_value` and the `msg` unchanged. The old
+    // spelling is kept alongside it, so both must complete the sweep.
+    const table = new Map<string | undefined, ProbeAttempt>([
+      [undefined, ACCEPTED],
+      [SENTINEL, GLOBAL_REJECTED_RESPELT],
+      ['low', ACCEPTED],
+      ['medium', ACCEPTED],
+      ['high', ACCEPTED],
+      ['xhigh', ACCEPTED],
+      ['max', ACCEPTED],
+    ])
+    const outcome = await probeModel({ send: tableSender(table), sentinel: () => SENTINEL, region: 'global' })
+    expect(outcome.validation).toBe('validating')
+    expect(outcome.efforts).toEqual(['low', 'medium', 'high', 'xhigh', 'max'])
+    expect(outcome.requests).toBe(7)
+  })
+
+  it('reads the respelled parameter rejection on the China endpoint too', async () => {
+    // Observed on www.workbuddy.cn 2026-10-16 (`deepseek-v4-pro`, PR #145
+    // discussion) and reproduced 2026-10-17 on WorkBuddy CN 5.8.2, so the
+    // respelled spelling is attributed on both regions.
+    const table = new Map<string | undefined, ProbeAttempt>([
+      [undefined, ACCEPTED],
+      [SENTINEL, GLOBAL_REJECTED_RESPELT],
+      ['low', ACCEPTED],
+      ['medium', ACCEPTED],
+      ['high', ACCEPTED],
+      ['xhigh', ACCEPTED],
+      ['max', ACCEPTED],
+    ])
+    const outcome = await probeModel({ send: tableSender(table), sentinel: () => SENTINEL, region: 'cn' })
     expect(outcome.validation).toBe('validating')
     expect(outcome.efforts).toEqual(['low', 'medium', 'high', 'xhigh', 'max'])
   })

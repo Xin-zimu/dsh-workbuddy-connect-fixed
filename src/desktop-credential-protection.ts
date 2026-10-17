@@ -1541,6 +1541,12 @@ function decodeStrict(bytes: Buffer, encoding: string): string | undefined {
  * the text it produces is not the diagnostic.
  *
  * @param stderr - the child's stderr exactly as it arrived.
+ *
+ * Two implementations of this fix met in the 0.7.7 merge: this one, and
+ * upstream's `windowsRegistryKeyMissingFromBytes`, which reached the same
+ * conclusion independently. This one is kept because it decodes with
+ * `fatal: true`, so a wrong code page answers `undefined` rather than a silent
+ * near-miss, and because the match must be the whole anchored message.
  */
 function windowsRegistryKeyMissing(stderr: Buffer): boolean {
   // UTF-8 first: it is the encoding of the English message, and the one every

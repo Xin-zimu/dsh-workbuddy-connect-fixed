@@ -687,17 +687,23 @@ interface Envelope {
  * body-read error instead would replace a diagnosable upstream failure with an
  * opaque transport one.
  *
- * An object without a `body` **property at all** is not a fetch Response: a
- * real one always carries a stream, so the cap below always applies in
- * production. The `.text()` fallback exists for in-process test doubles that
- * model only `ok`/`status`/`text`; the retained text is still trimmed to
- * `limit`, so the value handed to a caller is bounded either way. `null` is a
- * genuinely empty body and is distinct from that case.
+ * An absent **or null** `body` does not prove there is nothing to read. For a
+ * real fetch Response `null` does mean an empty body, so `text()` answers `''`
+ * and treating the two alike costs nothing — but a request that failed with a
+ * JSON error body is exactly the case this function exists to describe, and
+ * some runtime doubles (and older polyfills) expose `body: null` while still
+ * answering `text()` with the payload. Short-circuiting `null` to `''` threw
+ * that payload away, so an upstream 400 was reported as a bare `(http 400)`
+ * with no excerpt — and the effort-rejection code the probe classifies lives
+ * in that excerpt, so such a caller silently degraded to `unknown`.
+ *
+ * The cap therefore applies whenever a stream is present; without one the
+ * value still comes from `text()` and is still trimmed to `limit`, so the
+ * result is bounded either way.
  */
 async function readBodyText(response: Response, limit: number): Promise<string> {
   const body: ReadableStream<Uint8Array> | null | undefined = response.body
-  if (body === undefined) return (await response.text()).slice(0, limit)
-  if (body === null) return ''
+  if (body === null || body === undefined) return (await response.text()).slice(0, limit)
   const reader = body.getReader()
   const decoder = new TextDecoder()
   let text = ''

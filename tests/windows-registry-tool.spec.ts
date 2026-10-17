@@ -22,12 +22,13 @@ function registryFailure(stderr: string | Buffer, killed = false): void {
   ) => {
     const child = new EventEmitter()
     const error = Object.assign(new Error('reg query failed'), { code: 1, killed })
+    const stderrBytes = typeof stderr === 'string' ? Buffer.from(stderr, 'utf8') : stderr
     queueMicrotask(() => {
       // Bytes pass through untouched; a string is UTF-8 encoded, which is what
       // a caller writing a literal expects. The production path hands over raw
       // bytes (`encoding: 'buffer'`), so a test that cares about the code page
       // must pass the Buffer itself.
-      callback(error, Buffer.alloc(0), typeof stderr === 'string' ? Buffer.from(stderr, 'utf8') : stderr)
+      callback(error, Buffer.alloc(0), stderrBytes)
       child.emit('close')
     })
     return child
@@ -109,30 +110,44 @@ describe('Windows registry query failure classification', () => {
    * Windows app discovery degrades to `electron-binary-unavailable`.
    *
    * The bytes are spelled out rather than produced by `Buffer.from(text,
-   * 'gbk')`, because Node has no GBK *encoder* — only the decoder — so this
-   * literal is the only way to state the real input. They are exactly the
-   * bytes captured from the child.
+   * 'gbk')`, because Node has no GBK *encoder* — only the decoder — so a
+   * literal is the only way to state the real input. Upstream reached the same
+   * fix independently and contributed the second entry: the same message with
+   * the **fullwidth** colon, which cp936 also produces. Both are real host
+   * output, so both are pinned.
    */
   const GBK_KEY_MISSING = Buffer.from(
     'b4edcef33a20cfb5cdb3d5d2b2bbb5bdd6b8b6a8b5c4d7a2b2e1b1edcfeebbf2d6b5a1a30d0a',
     'hex',
   )
+  /** The same diagnostic with `：` (U+FF1A) instead of the ASCII colon. */
+  const GBK_KEY_MISSING_FULLWIDTH = Buffer.from(
+    'b4edcef3a3bacfb5cdb3d5d2b2bbb5bdd6b8b6a8b5c4d7a2b2e1b1edcfeebbf2d6b5a1a3',
+    'hex',
+  )
 
-  it('treats the GBK missing-key diagnostic as an empty result (zh-CN host, windowsHide)', async () => {
+  it.each([
+    ['ASCII colon', GBK_KEY_MISSING],
+    ['fullwidth colon', GBK_KEY_MISSING_FULLWIDTH],
+  ])('treats the GBK missing-key diagnostic as an empty result (zh-CN host, windowsHide, %s)', async (_label, bytes) => {
     vi.stubEnv('SystemRoot', 'C:\\Windows')
-    registryFailure(GBK_KEY_MISSING)
+    registryFailure(bytes)
     await expect(workBuddyWindowsDiscoveryTools().queryUninstallRoot('HKCU\\Missing', new AbortController().signal))
       .resolves.toBe('')
     expect(execFileMock).toHaveBeenCalledTimes(1)
   })
 
-  it('confirms the fixture really is GBK and really is not UTF-8', () => {
-    // Guards the guard: if this fixture ever became valid UTF-8 (or stopped
-    // decoding as GBK), the test above would still pass for the wrong reason
+  it.each([
+    ['ASCII colon', GBK_KEY_MISSING],
+    ['fullwidth colon', GBK_KEY_MISSING_FULLWIDTH],
+  ])('confirms the %s fixture really is GBK and really is not UTF-8', (_label, bytes) => {
+    // Guards the guard: if either fixture ever became valid UTF-8 (or stopped
+    // decoding as GBK), the case above would still pass for the wrong reason
     // and prove nothing about the code page.
-    expect(GBK_KEY_MISSING.every(byte => byte < 0x80), 'the fixture must carry non-ASCII bytes').toBe(false)
-    expect(new TextDecoder('gbk').decode(GBK_KEY_MISSING).trim()).toBe('错误: 系统找不到指定的注册表项或值。')
-    expect(() => new TextDecoder('utf-8', { fatal: true }).decode(GBK_KEY_MISSING)).toThrow()
+    expect(bytes.every(byte => byte < 0x80), 'the fixture must carry non-ASCII bytes').toBe(false)
+    expect(() => new TextDecoder('utf-8', { fatal: true }).decode(bytes)).toThrow()
+    // Both decode to the diagnostic, differing only in the colon glyph.
+    expect(new TextDecoder('gbk').decode(bytes).trim()).toMatch(/^错误[:：]\s*系统找不到指定的注册表项或值。$/u)
   })
 
   it('does not accept the GBK diagnostic when it is not the whole message', async () => {

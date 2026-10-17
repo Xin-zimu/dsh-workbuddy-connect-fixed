@@ -86,22 +86,33 @@ export type ProbeRegion = 'cn' | 'global'
  * - `model_param_invalid` — the global endpoint, measured 2026-10-01. A
  *   non-canonical value is answered `400` / `11133` with this code, which names
  *   no field (`extError.param` is empty), instead of one that names the effort.
- *   It is generic enough to be readable here only because the baseline step has
- *   already proved the *same* request without `reasoning_effort` succeeds,
- *   leaving the sentinel as the only difference between the two attempts. A
- *   sibling code in the same `11133` envelope that names another parameter
- *   (`integer_below_min_value`, the `max_tokens` floor) and a body carrying no
- *   `extError` at all (`11102`, unknown model) are therefore not mistaken for
- *   it, and neither is a level-sweep answer. It is *not* added to `cn`: that
- *   endpoint was measured answering the specific code, and reading a generic
- *   code there would widen attribution beyond what was observed.
+ * - `invalid_parameter_value` — both endpoints. Measured on the global
+ *   endpoint 2026-10-16 (issue #143); observed on the China endpoint the same
+ *   day (`deepseek-v4-pro`, PR #145 discussion) and reproduced there
+ *   2026-10-17 on WorkBuddy CN 5.8.2. The *same* `400` / `11133` envelope as
+ *   `model_param_invalid`, with `extError.code` respelled and the `msg`
+ *   unchanged; a non-canonical value is again what triggers it and the
+ *   baseline still answers 200. Kept alongside the old spellings rather than
+ *   replacing them: the rename was observed on the gateways, not promised for
+ *   every model behind them.
  *
- * Neither is treated as a permanent protocol promise: anything unrecognized
- * still degrades to `unknown` rather than to a capability conclusion.
+ * The generic codes name no effort field. They are readable here only
+ * because the baseline step has already proved the *same* request without
+ * `reasoning_effort` succeeds, leaving the sentinel as the only difference
+ * between the two attempts — an isolation that holds per endpoint, which is
+ * why both regions read the respelled spelling once each was observed on it.
+ * A sibling code in the same `11133` envelope that names another parameter
+ * (`integer_below_min_value`, the `max_tokens` floor) and a body carrying no
+ * `extError` at all (`11102`, unknown model) are therefore not mistaken for
+ * them, and neither is a level-sweep answer.
+ *
+ * None of these is treated as a permanent protocol promise: anything
+ * unrecognized still degrades to `unknown` rather than to a capability
+ * conclusion.
  */
 const INVALID_EFFORT_CODES: Record<ProbeRegion, ReadonlySet<string>> = {
-  cn: new Set(['invalid_reasoning_effort']),
-  global: new Set(['invalid_reasoning_effort', 'model_param_invalid']),
+  cn: new Set(['invalid_reasoning_effort', 'invalid_parameter_value']),
+  global: new Set(['invalid_reasoning_effort', 'model_param_invalid', 'invalid_parameter_value']),
 }
 
 /** Whether an attempt is an attributable rejection of the effort value. */
