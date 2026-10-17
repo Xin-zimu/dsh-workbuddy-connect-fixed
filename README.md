@@ -23,6 +23,7 @@
 
 | DSH 内核 | 推荐插件版 |
 |---|---|
+| 0.2.1-rc.2 | 0.7.7+（本 fork；peer 已放行 rc.2） |
 | 0.2.1-rc.1 | 0.7.7（npm latest） |
 | 0.2.0-rc.2 | 0.7.6 |
 | 0.2.0-rc.1 | 0.7.0 |
@@ -128,7 +129,8 @@ dsh plugin --profile web exec dsh-workbuddy-connect doctor --provider workbuddy-
 
 | DSH 内核 | 推荐插件版 | 注意事项 |
 |---|---|---|
-| `0.2.1-rc.1` | `0.7.7` | 当前最新线；内核升级到 `@earendil-works/pi-ai` 1.3.0，插件同步自带 1.3.0，历史遗留的 0.87.1 overrides 必须移除（见下方 pi-ai 说明）。 |
+| `0.2.1-rc.2` | `0.7.7+`（本 fork） | Desktop 自动更新到 rc.2 后，上游 0.7.7 的 peer 仍只列 rc.1，会被判「不兼容」而拒绝加载。本 fork 把 peer 改为精确枚举 `0.2.1-rc.1 \|\| 0.2.1-rc.2`，两个内核都放行；rc.2 上的兼容性用 devDependencies 升到 rc.2 后跑全量 858 passed 验证，未用 caret/`>=` 放宽。 |
+| `0.2.1-rc.1` | `0.7.7` | 内核升级到 `@earendil-works/pi-ai` 1.3.0，插件同步自带 1.3.0，历史遗留的 0.87.1 overrides 必须移除（见下方 pi-ai 说明）。 |
 | `0.2.0-rc.2` | `0.7.6` | 上一代内核线；修复企业账号模型目录缺项与国际版对话被渠道校验拦截，勿停留在有注册表回归的 0.7.2。 |
 | `0.2.0-rc.1` | `0.7.0` | 0.7.1 起不再支持 rc.1，请停留本版。 |
 | `0.1.5` – `0.1.7` | `0.6.5` | 旧内核最终版；0.7.0 起仅面向 0.2.0。 |
@@ -136,6 +138,8 @@ dsh plugin --profile web exec dsh-workbuddy-connect doctor --provider workbuddy-
 | `0.1.1-rc.2` | `0.2.6` | 更早旧线，仅历史维护。 |
 
 历次更新（完整记录见 [releases](https://github.com/corrinehu/dsh-workbuddy-connect/releases)）：
+
+- **0.7.7+（本 fork）**：适配 DSH **0.2.1-rc.2** 内核。Desktop 自动更新到 rc.2 后，上游 0.7.7 的 peer 仍只列 `0.2.1-rc.1`，DSH 的 manifest 校验（`dsh-app-boot` 的 `unmetRequirements`）会判 7 个 peer 全部不满足并拒绝加载，插件卡片显示「与 DSH 0.2.1-rc.2 不兼容」。本 fork 把 peer 改为**精确枚举** `0.2.1-rc.1 || 0.2.1-rc.2`：不用 caret、不用 `>=`，因为那会静默放行未验证的 `0.2.1-rc.3`／`0.2.2-rc.1`。rc.2 的兼容性是实测的——devDependencies 升到 `0.2.1-rc.2` 后 `tsc` 按 rc.2 自身类型面检查、全量 858 passed，然后才放宽；`tests/version.spec.ts` 仍以字面量守门，每次放宽都必须手工改那个文件。
 
 - **0.7.7**：适配 DSH 0.2.1-rc.1 内核：peer 收窄到 0.2.1-rc.1，插件自带的 `@earendil-works/pi-ai` 随内核升级到 1.3.0（profile 级历史遗留的 0.87.1 overrides 必须移除，否则插件无法加载）；修复国际版与国内版推理档位检测停留「检测未完成」——上游把档位拒绝码改拼为 `invalid_parameter_value`（[#143](https://github.com/corrinehu/dsh-workbuddy-connect/issues/143) / [#148](https://github.com/corrinehu/dsh-workbuddy-connect/issues/148)，PR [#145](https://github.com/corrinehu/dsh-workbuddy-connect/pull/145)）；修复中文 Windows 控制台下注册表缺键诊断因 GBK 编码被误判（zh-CN 实机验证）。
 - **0.7.6**：修复企业账号模型目录缺少 `glm-5.3-flashx`（[#123](https://github.com/corrinehu/dsh-workbuddy-connect/issues/123)），修复国际版对话请求被上游渠道校验拦截（[#139](https://github.com/corrinehu/dsh-workbuddy-connect/issues/139) / [#142](https://github.com/corrinehu/dsh-workbuddy-connect/issues/142)）。

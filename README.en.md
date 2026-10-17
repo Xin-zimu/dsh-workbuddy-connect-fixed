@@ -23,6 +23,7 @@ Core-to-plugin quick reference (full table in "Compatibility and release history
 
 | DSH core | Recommended plugin |
 |---|---|
+| 0.2.1-rc.2 | 0.7.7+ (this fork; rc.2 admitted by the peer range) |
 | 0.2.1-rc.1 | 0.7.7 (npm latest) |
 | 0.2.0-rc.2 | 0.7.6 |
 | 0.2.0-rc.1 | 0.7.0 |
@@ -127,7 +128,8 @@ The plugin version must match the DSH core — a mismatched combination fails to
 
 | DSH core | Recommended plugin | Notes |
 |---|---|---|
-| `0.2.1-rc.1` | `0.7.7` | Current line; the core moved to `@earendil-works/pi-ai` 1.3.0, so the plugin bundles 1.3.0 too — a leftover 0.87.1 overrides entry must be removed (see the pi-ai note below). |
+| `0.2.1-rc.2` | `0.7.7+` (this fork) | When Desktop auto-updated to rc.2, upstream 0.7.7 still listed only rc.1 as a peer, so DSH's manifest check rejected it as incompatible. This fork enumerates the peer exactly — `0.2.1-rc.1 \|\| 0.2.1-rc.2` — so both cores load. rc.2 compatibility was measured, not assumed: devDependencies moved to rc.2 so `tsc` checked against rc.2's own types, then the full 858-test suite ran, before the range was widened. No caret, no `>=`: those would silently admit unverified rc.3/0.2.2 prereleases. |
+| `0.2.1-rc.1` | `0.7.7` | The core moved to `@earendil-works/pi-ai` 1.3.0, so the plugin bundles 1.3.0 too — a leftover 0.87.1 overrides entry must be removed (see the pi-ai note below). |
 | `0.2.0-rc.2` | `0.7.6` | Previous core line; fixes enterprise catalog gaps and international chat requests blocked by the upstream channel check. Avoid 0.7.2 with its registry regression. |
 | `0.2.0-rc.1` | `0.7.0` | 0.7.1 drops rc.1 support; stay on this version. |
 | `0.1.5` – `0.1.7` | `0.6.5` | Final release for the old cores; 0.7.0 targets 0.2.0 only. |

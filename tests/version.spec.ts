@@ -83,12 +83,64 @@ describe('peer manifest pins the verified DSH cores', () => {
     '@deepseek-ai/dsh-settings',
   ] as const
 
+  /**
+   * The cores this release was actually smoke-tested on, as an exhaustive list.
+   *
+   * Enumerated, never a range. `>=0.2.1-rc.1 <0.2.2` and `^0.2.1-rc.1` both
+   * admit `0.2.1-rc.3` and `0.2.2-rc.1`, which nobody ran here — the same
+   * silent auto-extension #69 recorded. Adding a kernel to this list is a
+   * deliberate edit made *after* a real run, which is exactly the property
+   * this test exists to keep.
+   *
+   * rc.2 joined the list when DSH Desktop auto-updated to it and rejected
+   * 0.7.7 at load time with "与 DSH 0.2.1-rc.2 不兼容". Compatibility was
+   * established before widening, not assumed: devDependencies were moved to
+   * 0.2.1-rc.2 so `tsc` checked against rc.2's own type surface, and the full
+   * suite (857 passed, 7 skipped) ran on rc.2. The one host API that is absent
+   * from rc.2 — `settings.installSection` — is absent from every 0.2.x core by
+   * design, and the plugin probes for it at runtime and degrades.
+   */
+  const VERIFIED_DSH_CORES = ['0.2.1-rc.1', '0.2.1-rc.2'] as const
+
   it('each DSH service peer is an exact, caret-free list of verified cores', () => {
     const pkg = JSON.parse(
       readFileSync(new URL('../package.json', import.meta.url), 'utf8'),
     ) as { peerDependencies: Record<string, string> }
+    // The literal the manifest must carry: the enumerated arms joined by `||`,
+    // so the widening mechanism itself is caret- and `>=`-free.
+    const expected = VERIFIED_DSH_CORES.join(' || ')
     for (const name of DSH_SERVICE_PEERS) {
-      expect(pkg.peerDependencies[name], `${name} missing from peerDependencies`).toBe('0.2.1-rc.1')
+      expect(pkg.peerDependencies[name], `${name} missing from peerDependencies`).toBe(expected)
+    }
+  })
+
+  it('that peer range admits every verified core and nothing else', () => {
+    // Without this, the assertion above would only pin a string: a typo that
+    // silently admits or excludes a core would still match a hand-edited
+    // expectation. This checks the *shape* of the literal, which is the part
+    // that decides what a host sees.
+    //
+    // Deliberately not resolved with `semver`: that package is not a
+    // dependency here, and adding one so a test can restate what `||` means
+    // would grow the shipped footprint to prove a property of a string. The
+    // two shapes that could silently auto-extend support are ruled out
+    // directly instead — a `^`/`~`/`>=` arm, or a single arm, would each admit
+    // cores nobody ran.
+    const pkg = JSON.parse(
+      readFileSync(new URL('../package.json', import.meta.url), 'utf8'),
+    ) as { peerDependencies: Record<string, string> }
+    for (const name of DSH_SERVICE_PEERS) {
+      const range = pkg.peerDependencies[name]!
+      // Exactly one arm per verified core, and every arm an exact version.
+      const arms = range.split('||').map(arm => arm.trim())
+      expect(arms, `${name} must enumerate exactly the verified cores`).toEqual([...VERIFIED_DSH_CORES])
+      for (const arm of arms) {
+        expect(arm, `${name} arm "${arm}" must be an exact version, not a range`)
+          .toMatch(/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/u)
+      }
+      // No arm may be a caret, tilde, comparator, wildcard, or `x`-range: each
+      // of those would admit a core this release never ran against.
+      expect(range, `${name} must not widen with ^ ~ > < = * or x`).not.toMatch(/[\^~><=*]|\bx\b/iu)
     }
   })
 
